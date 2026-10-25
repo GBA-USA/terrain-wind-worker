@@ -3,6 +3,7 @@ out/
 output/
 work/
 tmp/
+dem-cache/
 *.tif
 *.tiff
 *.asc
