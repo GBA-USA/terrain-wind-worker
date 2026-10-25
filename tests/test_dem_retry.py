@@ -17,25 +17,35 @@ class DemRetryTests(unittest.TestCase):
         outcomes = [
             urllib.error.URLError("transient"),
             urllib.error.URLError("transient"),
-            (payload, {}),
+            (payload, {}, 200, None),
         ]
+        seen_urls = []
 
-        def fake_http(url, headers=None, timeout=120):
+        def fake_response(url, headers=None, timeout=120):
+            seen_urls.append(url)
             item = outcomes.pop(0)
             if isinstance(item, BaseException):
-                raise item
+                return b"", None, None, item
             return item
 
-        with patch.object(terrain_wind, "http_bytes", side_effect=fake_http), patch.object(
+        def url_for_attempt(attempt):
+            return f"https://example.test/dem?attempt={attempt}"
+
+        with patch.object(terrain_wind, "http_bytes_response", side_effect=fake_response), patch.object(
             terrain_wind.time, "sleep"
         ):
             data, _headers = terrain_wind.http_bytes_retry(
                 "DEM download",
-                "https://example.test/dem",
+                url_for_attempt(0),
+                url_for_attempt=url_for_attempt,
                 validate=lambda body: body[:4] in terrain_wind.TIFF_MAGIC,
                 fail_message="DEM download failed",
             )
         self.assertEqual(data, payload)
+        self.assertEqual(len(seen_urls), 3)
+        self.assertEqual(len(set(seen_urls)), 3)
+        self.assertNotEqual(seen_urls[0], seen_urls[1])
+        self.assertNotEqual(seen_urls[1], seen_urls[2])
 
 
 if __name__ == "__main__":
