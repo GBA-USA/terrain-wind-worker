@@ -68,6 +68,39 @@ def http_bytes(url, headers=None, timeout=120):
         return response.read(), response.headers
 
 
+def http_bytes_response(url, headers=None, timeout=120):
+    req_headers = dict(UA)
+    if headers:
+        req_headers.update(headers)
+    request = urllib.request.Request(url, headers=req_headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read(), response.headers, response.status, None
+    except urllib.error.HTTPError as exc:
+        return exc.read(), exc.headers, exc.code, exc
+    except Exception as exc:
+        return b"", None, None, exc
+
+
+def response_content_type(headers):
+    if headers is None:
+        return "unknown"
+    if hasattr(headers, "get_content_type"):
+        return headers.get_content_type()
+    return headers.get("Content-Type", "unknown")
+
+
+def log_failed_http_attempt(label, attempt, data, headers, status, error):
+    if status is not None:
+        detail = f"HTTP {status}"
+    elif error is not None:
+        detail = type(error).__name__
+    else:
+        detail = "error"
+    ctype = response_content_type(headers)
+    log(f"{label} attempt {attempt + 1} failed: {detail} content-type={ctype} bytes={len(data)}")
+
+
 TIFF_MAGIC = (b"II*\x00", b"MM\x00*")
 HTTP_RETRY_BACKOFFS = (5, 15)
 
@@ -76,6 +109,7 @@ def http_bytes_retry(
     label,
     url,
     *,
+    url_for_attempt=None,
     headers=None,
     timeout=120,
     attempts=3,
@@ -84,17 +118,20 @@ def http_bytes_retry(
     fail_message=None,
 ):
     for attempt in range(attempts):
-        try:
-            data, resp_headers = http_bytes(url, headers=headers, timeout=timeout)
-            if validate is not None and not validate(data):
-                raise ValueError("response was not valid")
+        request_url = url_for_attempt(attempt) if url_for_attempt is not None else url
+        data, resp_headers, status, error = http_bytes_response(
+            request_url,
+            headers=headers,
+            timeout=timeout,
+        )
+        if error is None and (validate is None or validate(data)):
             return data, resp_headers
-        except Exception:
-            if attempt + 1 >= attempts:
-                break
-            delay = backoffs[attempt] if attempt < len(backoffs) else backoffs[-1]
-            log(f"{label} retry {attempt + 1}, waiting {delay}s")
-            time.sleep(delay)
+        log_failed_http_attempt(label, attempt, data, resp_headers, status, error)
+        if attempt + 1 >= attempts:
+            break
+        delay = backoffs[attempt] if attempt < len(backoffs) else backoffs[-1]
+        log(f"{label} retry {attempt + 1}, waiting {delay}s")
+        time.sleep(delay)
     raise RuntimeError(fail_message or f"{label} failed")
 
 
@@ -303,21 +340,28 @@ def download_dem(bbox, dest):
     height = max(2, int(round((max_lat - min_lat) * 111320.0 / 30.0)))
     width = min(width, 2500)
     height = min(height, 2500)
-    query = urllib.parse.urlencode(
-        {
-            "bbox": f"{min_lon},{min_lat},{max_lon},{max_lat}",
-            "bboxSR": "4326",
-            "imageSR": "4326",
-            "size": f"{width},{height}",
-            "format": "tiff",
-            "pixelType": "F32",
-            "interpolation": "RSP_BilinearInterpolation",
-            "f": "image",
-        }
-    )
+    base_params = {
+        "bbox": f"{min_lon},{min_lat},{max_lon},{max_lat}",
+        "bboxSR": "4326",
+        "imageSR": "4326",
+        "format": "tiff",
+        "pixelType": "F32",
+        "interpolation": "RSP_BilinearInterpolation",
+        "f": "image",
+    }
+
+    def dem_url_for_attempt(attempt):
+        params = dict(base_params)
+        shrink = attempt
+        params["size"] = f"{max(2, width - shrink)},{max(2, height - shrink)}"
+        if attempt > 0:
+            params["_cb"] = str(attempt)
+        return f"{DEM_URL}?{urllib.parse.urlencode(params)}"
+
     data, _headers = http_bytes_retry(
         "DEM download",
-        f"{DEM_URL}?{query}",
+        dem_url_for_attempt(0),
+        url_for_attempt=dem_url_for_attempt,
         timeout=180,
         validate=lambda body: body[:4] in TIFF_MAGIC,
         fail_message="DEM download failed",
