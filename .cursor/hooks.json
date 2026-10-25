@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "command": ".cursor/hooks/context-mode-hook.sh pretooluse",
+        "matcher": "Shell|Read|Grep|WebFetch|mcp_web_fetch|mcp_fetch_tool|Task|MCP:ctx_execute|MCP:ctx_execute_file|MCP:ctx_batch_execute|MCP:(?!ctx_)"
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": ".cursor/hooks/context-mode-hook.sh posttooluse"
+      }
+    ],
+    "stop": [
+      {
+        "command": ".cursor/hooks/context-mode-hook.sh stop"
+      }
+    ]
+  }
+}

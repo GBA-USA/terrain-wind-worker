@@ -1,0 +1,23 @@
+# Build and run artifacts
+out/
+output/
+work/
+tmp/
+*.tif
+*.tiff
+*.asc
+*.prj
+*.kmz
+*.zip
+*.nc
+*.grib2
+*.json.gz
+# Environment and secrets
+.env
+.env.*
+*.pem
+# OS / editor
+.DS_Store
+.vscode/
+__pycache__/
+*.pyc
