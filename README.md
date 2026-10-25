@@ -35,10 +35,10 @@ S3 endpoint `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`, region `auto`. I
 Hour JSON:
 
 ```json
-{"v":1,"area":"<key>","run":"<ISO-8601>","hour":"<ISO-8601>","bbox":[minLon,minLat,maxLon,maxLat],"nx":0,"ny":0,"cell_m":100,"u":[],"v":[]}
+{"ver":1,"area":"<key>","run":"<ISO-8601>","hour":"<ISO-8601>","bbox":[minLon,minLat,maxLon,maxLat],"nx":0,"ny":0,"cell_m":100,"u":[],"v":[]}
 ```
 
-`u` (east) and `v` (north) are m/s rounded to 0.1, row-major from the northwest corner. Timestamps are UTC `YYYY-MM-DDTHH:MM:SSZ`. Runs older than 48 hours are deleted.
+`u` (east) and `v` (north) are m/s rounded to 0.1, row-major from the northwest corner; cells with no data are JSON `null`. Timestamps are UTC `YYYY-MM-DDTHH:MM:SSZ`. Runs older than 48 hours are deleted.
 
 Each hour uses NOAA HRRR 10 m wind (AWS Open Data byte ranges), a USGS 3DEP DEM cached by area key, and WindNinja with diurnal winds and non-neutral stability.
 

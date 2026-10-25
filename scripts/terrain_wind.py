@@ -604,6 +604,32 @@ def run_windninja(cfg, env):
     run([binary, str(cfg)], env=env, timeout=240)
 
 
+def sanitize_resampled_values(values, nodata):
+    cleaned = []
+    for value in values:
+        if not math.isfinite(value) or abs(value - nodata) < 0.1 or value < -9000:
+            cleaned.append(None)
+        else:
+            rounded = round(value, 1)
+            cleaned.append(0.0 if rounded == 0 else rounded)
+    return cleaned
+
+
+def hour_record_payload(area_key, hour_stamp, bbox, nx, ny, cell_m, u_values, v_values, run_stamp=None):
+    return {
+        "ver": 1,
+        "area": area_key,
+        "run": run_stamp,
+        "hour": hour_stamp,
+        "bbox": bbox,
+        "nx": nx,
+        "ny": ny,
+        "cell_m": cell_m,
+        "u": u_values,
+        "v": v_values,
+    }
+
+
 def output_grid(asc_path, bbox, nx, ny, work, name):
     tagged = work / f"{name}-4326.tif"
     warped = work / f"{name}-out.tif"
@@ -634,13 +660,7 @@ def output_grid(asc_path, bbox, nx, ny, work, name):
     )
     run(["gdal_translate", "-q", "-of", "AAIGrid", str(warped), str(asc)])
     _ncols, _nrows, nodata, values = read_asc(asc)
-    cleaned = []
-    for value in values:
-        if not math.isfinite(value) or abs(value - nodata) < 0.1 or value < -9000:
-            cleaned.append(0.0)
-        else:
-            rounded = round(value, 1)
-            cleaned.append(0.0 if rounded == 0 else rounded)
+    cleaned = sanitize_resampled_values(values, nodata)
     if len(cleaned) != nx * ny:
         raise RuntimeError("resampled grid does not match nx*ny")
     return cleaned
@@ -878,18 +898,7 @@ def process_area(area, cycle, prefix, cache_dir, storage):
             records.append(
                 (
                     hour_stamp,
-                    {
-                        "v": 1,
-                        "area": key,
-                        "run": None,
-                        "hour": hour_stamp,
-                        "bbox": bbox,
-                        "nx": nx,
-                        "ny": ny,
-                        "cell_m": cell_m,
-                        "u": u_values,
-                        "v": v_values,
-                    },
+                    hour_record_payload(key, hour_stamp, bbox, nx, ny, cell_m, u_values, v_values),
                 )
             )
         except Exception as exc:
