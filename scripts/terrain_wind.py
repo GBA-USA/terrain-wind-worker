@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -65,6 +66,36 @@ def http_bytes(url, headers=None, timeout=120):
     request = urllib.request.Request(url, headers=req_headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return response.read(), response.headers
+
+
+TIFF_MAGIC = (b"II*\x00", b"MM\x00*")
+HTTP_RETRY_BACKOFFS = (5, 15)
+
+
+def http_bytes_retry(
+    label,
+    url,
+    *,
+    headers=None,
+    timeout=120,
+    attempts=3,
+    backoffs=HTTP_RETRY_BACKOFFS,
+    validate=None,
+    fail_message=None,
+):
+    for attempt in range(attempts):
+        try:
+            data, resp_headers = http_bytes(url, headers=headers, timeout=timeout)
+            if validate is not None and not validate(data):
+                raise ValueError("response was not valid")
+            return data, resp_headers
+        except Exception:
+            if attempt + 1 >= attempts:
+                break
+            delay = backoffs[attempt] if attempt < len(backoffs) else backoffs[-1]
+            log(f"{label} retry {attempt + 1}, waiting {delay}s")
+            time.sleep(delay)
+    raise RuntimeError(fail_message or f"{label} failed")
 
 
 def content_length(url):
@@ -284,12 +315,13 @@ def download_dem(bbox, dest):
             "f": "image",
         }
     )
-    try:
-        data, _headers = http_bytes(f"{DEM_URL}?{query}", timeout=180)
-    except Exception:
-        raise RuntimeError("DEM download failed") from None
-    if data[:4] not in (b"II*\x00", b"MM\x00*"):
-        raise RuntimeError("DEM download failed")
+    data, _headers = http_bytes_retry(
+        "DEM download",
+        f"{DEM_URL}?{query}",
+        timeout=180,
+        validate=lambda body: body[:4] in TIFF_MAGIC,
+        fail_message="DEM download failed",
+    )
     raw = dest.with_suffix(".ll.tif")
     raw.write_bytes(data)
     epsg = utm_epsg((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
