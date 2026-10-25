@@ -31,14 +31,14 @@ jobs:
       AREAS_URL: ${{ secrets.AREAS_URL }}
       AREAS_TOKEN: ${{ secrets.AREAS_TOKEN }}
       TEST_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.test == 'true' }}
-      WINDNINJA_PREFIX: ${{ runner.tool_cache }}/windninja
       DEM_CACHE: ${{ github.workspace }}/dem-cache
-      AREAS_FILE: ${{ runner.temp }}/areas.json
     steps:
       - uses: actions/checkout@v4
 
       - name: Resolve areas
         id: areas
+        env:
+          AREAS_FILE: ${{ runner.temp }}/areas.json
         run: python3 scripts/terrain_wind.py resolve
 
       - name: Cache WindNinja
@@ -59,6 +59,9 @@ jobs:
 
       - name: Run WindNinja and upload
         if: steps.areas.outputs.has_areas == 'true'
+        env:
+          WINDNINJA_PREFIX: ${{ runner.tool_cache }}/windninja
+          AREAS_FILE: ${{ runner.temp }}/areas.json
         run: |
           bash scripts/build_windninja.sh
           python3 scripts/terrain_wind.py run
