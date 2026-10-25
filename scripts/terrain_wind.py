@@ -25,6 +25,8 @@ DEM_URL = (
 )
 FORECAST_HOURS = range(1, 19)
 MAX_EDGE_KM = 40
+TILE_EPS = 1e-9
+TILE_CAP = 60
 DEM_BUFFER_M = 800
 CELL_M = 100
 UA = {"User-Agent": "terrain-wind-worker"}
@@ -147,6 +149,51 @@ def validate_areas(document):
     return areas
 
 
+def tile_indices_for_point(lat, lng):
+    return (
+        math.floor(lat * 10 + TILE_EPS),
+        math.floor(lng * 10 + TILE_EPS),
+    )
+
+
+def tile_key(lat_i, lng_i):
+    return f"t{lat_i}_{lng_i}"
+
+
+def tile_bbox(lat_i, lng_i):
+    return [lng_i / 10, lat_i / 10, (lng_i + 1) / 10, (lat_i + 1) / 10]
+
+
+def tiles_for_bbox(bbox):
+    min_lon, min_lat, max_lon, max_lat = bbox
+    lat_min = math.floor(min_lat * 10 + TILE_EPS)
+    lat_max = math.ceil(max_lat * 10 - TILE_EPS) - 1
+    lng_min = math.floor(min_lon * 10 + TILE_EPS)
+    lng_max = math.ceil(max_lon * 10 - TILE_EPS) - 1
+    tiles = {}
+    for lat_i in range(lat_min, lat_max + 1):
+        for lng_i in range(lng_min, lng_max + 1):
+            key = tile_key(lat_i, lng_i)
+            tiles[key] = tile_bbox(lat_i, lng_i)
+    return tiles
+
+
+def areas_from_tiles(tile_map):
+    return [{"key": key, "bbox": tile_map[key]} for key in sorted(tile_map)]
+
+
+def expand_areas_to_tiles(areas):
+    tiles = {}
+    for area in areas:
+        tiles.update(tiles_for_bbox(area["bbox"]))
+    expanded = areas_from_tiles(tiles)
+    if len(expanded) > TILE_CAP:
+        skipped = len(expanded) - TILE_CAP
+        log(f"tile cap reached, skipped {skipped}")
+        expanded = expanded[:TILE_CAP]
+    return expanded
+
+
 def resolve():
     out_path = Path(os.environ.get("AREAS_FILE", "areas.json"))
     test_mode = os.environ.get("TEST_MODE", "").strip().lower() == "true"
@@ -187,6 +234,8 @@ def resolve():
     except RuntimeError as exc:
         log(str(exc))
         sys.exit(1)
+    if not test_mode:
+        areas = expand_areas_to_tiles(areas)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps({"areas": areas}), encoding="utf-8")
     if not areas:
