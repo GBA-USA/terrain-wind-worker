@@ -1,0 +1,64 @@
+name: terrain-wind
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Use the fixture area and skip AREAS_URL"
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [areas-changed]
+
+concurrency:
+  group: terrain-wind
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  terrain-wind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      AREAS_URL: ${{ secrets.AREAS_URL }}
+      AREAS_TOKEN: ${{ secrets.AREAS_TOKEN }}
+      TEST_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.test == 'true' }}
+      WINDNINJA_PREFIX: ${{ runner.tool_cache }}/windninja
+      DEM_CACHE: ${{ github.workspace }}/dem-cache
+      AREAS_FILE: ${{ runner.temp }}/areas.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve areas
+        id: areas
+        run: python3 scripts/terrain_wind.py resolve
+
+      - name: Cache WindNinja
+        if: steps.areas.outputs.has_areas == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}/windninja
+          key: windninja-4.0.0-cli-mass-${{ runner.os }}-v1
+
+      - name: Cache DEMs
+        if: steps.areas.outputs.has_areas == 'true'
+        uses: actions/cache@v4
+        with:
+          path: dem-cache
+          key: dem-${{ steps.areas.outputs.cache_key }}
+          restore-keys: |
+            dem-
+
+      - name: Run WindNinja and upload
+        if: steps.areas.outputs.has_areas == 'true'
+        run: |
+          bash scripts/build_windninja.sh
+          python3 scripts/terrain_wind.py run
