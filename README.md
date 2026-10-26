@@ -42,6 +42,48 @@ Hour JSON:
 
 Each hour uses NOAA HRRR 10 m wind (AWS Open Data byte ranges), a USGS 3DEP DEM cached by area key, and WindNinja with diurnal winds and non-neutral stability.
 
+## Offline packs
+
+Separate workflow `offline-packs` builds public map chunks (Mapterhorn DEM + PAD-US) into the same R2 bucket. Triggers: daily `30 7 * * *` UTC, `workflow_dispatch` with `test=true` (fixture areas), and `repository_dispatch` type `areas-changed`. Concurrency group `offline-packs`.
+
+Per z14 web-mercator chunk:
+
+```
+packs/v1/z14/{x}/{y}/manifest.json
+packs/v1/z14/{x}/{y}/dem.pmtiles
+packs/v1/z14/{x}/{y}/public-land.geojson   # gzip Content-Encoding on upload
+```
+
+Manifest example:
+
+```json
+{
+  "v": 1,
+  "chunk": [14, 0, 0],
+  "bbox": [west, south, east, north],
+  "built": "2026-10-26T08:00:00Z",
+  "files": [
+    {
+      "name": "dem.pmtiles",
+      "bytes": 0,
+      "sha256": "…",
+      "zooms": [12, 17],
+      "tileUrl": "https://tiles.mapterhorn.com/{z}/{x}/{y}.webp"
+    },
+    {
+      "name": "public-land.geojson",
+      "bytes": 0,
+      "sha256": "…",
+      "features": 0
+    }
+  ],
+  "bytes": 0,
+  "attribution": ["Relief: Mapterhorn", "PAD-US: USGS"]
+}
+```
+
+Chunks whose manifest is missing, older than 30 days, or not `v: 1` are rebuilt. Caps: 64 chunks per area and 400 per run.
+
 ## License
 
 MIT. WindNinja has its own license.
