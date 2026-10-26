@@ -9,6 +9,30 @@ on:
         description: "Use the fixture area and skip AREAS_URL"
         type: boolean
         default: false
+      diurnal:
+        description: "WindNinja diurnal_winds"
+        type: boolean
+        default: true
+      stability:
+        description: "WindNinja non_neutral_stability (ignored when momentum is true)"
+        type: boolean
+        default: true
+      momentum:
+        description: "WindNinja momentum_flag solver"
+        type: boolean
+        default: false
+      tiles:
+        description: "Optional comma-separated tile keys (e.g. t386_-832,t387_-832); default all"
+        type: string
+        default: ""
+      hours:
+        description: "Optional comma-separated UTC hours to run (e.g. 16,17); default all forecast hours"
+        type: string
+        default: ""
+      prefix:
+        description: "R2 object key prefix for outputs (use non-wind to avoid production wind/)"
+        type: string
+        default: wind
   repository_dispatch:
     types: [areas-changed]
 
@@ -31,6 +55,12 @@ jobs:
       AREAS_URL: ${{ secrets.AREAS_URL }}
       AREAS_TOKEN: ${{ secrets.AREAS_TOKEN }}
       TEST_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.test == 'true' }}
+      TERRAIN_WIND_DIURNAL: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.diurnal && 'true' || 'false') || 'true' }}
+      TERRAIN_WIND_STABILITY: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.stability && 'true' || 'false') || 'true' }}
+      TERRAIN_WIND_MOMENTUM: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.momentum && 'true' || 'false') || 'false' }}
+      TERRAIN_WIND_TILES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tiles || '' }}
+      TERRAIN_WIND_HOURS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.hours || '' }}
+      TERRAIN_WIND_PREFIX: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prefix || 'wind' }}
       DEM_CACHE: ${{ github.workspace }}/dem-cache
     steps:
       - uses: actions/checkout@v4
