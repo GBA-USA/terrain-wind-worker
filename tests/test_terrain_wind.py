@@ -48,6 +48,118 @@ class SanitizeGridTests(unittest.TestCase):
         self.assertEqual(cleaned, [0.0, 0.0])
 
 
+class WindNinjaCfgTests(unittest.TestCase):
+    def options(self, **overrides):
+        base = {
+            "diurnal": True,
+            "stability": True,
+            "momentum": False,
+            "utc_hours": None,
+            "output_prefix": "wind",
+        }
+        base.update(overrides)
+        return base
+
+    def pairs(self, **overrides):
+        return dict(terrain_wind.build_base_cfg_pairs("/dem.tif", "/out", self.options(**overrides)))
+
+    def test_defaults_match_production_solver(self):
+        pairs = self.pairs()
+        self.assertEqual(pairs["diurnal_winds"], "true")
+        self.assertEqual(pairs["non_neutral_stability"], "true")
+        self.assertNotIn("momentum_flag", pairs)
+
+    def test_diurnal_off(self):
+        pairs = self.pairs(diurnal=False)
+        self.assertEqual(pairs["diurnal_winds"], "false")
+        self.assertEqual(pairs["non_neutral_stability"], "true")
+
+    def test_stability_off(self):
+        pairs = self.pairs(stability=False)
+        self.assertEqual(pairs["non_neutral_stability"], "false")
+
+    def test_momentum_adds_iterations_and_disables_stability(self):
+        pairs = self.pairs(momentum=True, stability=True)
+        self.assertEqual(pairs["momentum_flag"], "true")
+        self.assertEqual(pairs["number_of_iterations"], str(terrain_wind.MOMENTUM_ITERATIONS))
+        self.assertEqual(pairs["non_neutral_stability"], "false")
+
+    def test_momentum_off_with_stability_off(self):
+        pairs = self.pairs(momentum=False, stability=False)
+        self.assertNotIn("momentum_flag", pairs)
+        self.assertEqual(pairs["non_neutral_stability"], "false")
+
+    def test_run_options_from_env_defaults(self):
+        keys = (
+            "TERRAIN_WIND_DIURNAL",
+            "TERRAIN_WIND_STABILITY",
+            "TERRAIN_WIND_MOMENTUM",
+            "TERRAIN_WIND_HOURS",
+            "TERRAIN_WIND_PREFIX",
+        )
+        prior = {key: os.environ.pop(key, None) for key in keys}
+        try:
+            options = terrain_wind.windninja_run_options_from_env()
+        finally:
+            for key, value in prior.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        self.assertTrue(options["diurnal"])
+        self.assertTrue(options["stability"])
+        self.assertFalse(options["momentum"])
+        self.assertIsNone(options["utc_hours"])
+        self.assertEqual(options["output_prefix"], "wind")
+
+    def test_run_options_from_env_overrides(self):
+        prior = {
+            key: os.environ.get(key)
+            for key in (
+                "TERRAIN_WIND_DIURNAL",
+                "TERRAIN_WIND_STABILITY",
+                "TERRAIN_WIND_MOMENTUM",
+                "TERRAIN_WIND_HOURS",
+                "TERRAIN_WIND_PREFIX",
+            )
+        }
+        try:
+            os.environ["TERRAIN_WIND_DIURNAL"] = "false"
+            os.environ["TERRAIN_WIND_STABILITY"] = "false"
+            os.environ["TERRAIN_WIND_MOMENTUM"] = "true"
+            os.environ["TERRAIN_WIND_HOURS"] = "16,17"
+            os.environ["TERRAIN_WIND_PREFIX"] = "solver-test"
+            options = terrain_wind.windninja_run_options_from_env()
+        finally:
+            for key, value in prior.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        self.assertFalse(options["diurnal"])
+        self.assertFalse(options["stability"])
+        self.assertTrue(options["momentum"])
+        self.assertEqual(options["utc_hours"], {16, 17})
+        self.assertEqual(options["output_prefix"], "solver-test")
+
+
+class OutputPrefixTests(unittest.TestCase):
+    def test_wind_prefix_unchanged(self):
+        self.assertEqual(terrain_wind.normalize_output_prefix("wind"), "wind")
+        self.assertEqual(terrain_wind.object_prefix_for_area("t322_-816", "wind"), "wind/t322_-816/")
+
+    def test_alternate_prefix(self):
+        self.assertEqual(terrain_wind.normalize_output_prefix("solver-test"), "solver-test")
+        self.assertEqual(
+            terrain_wind.object_prefix_for_area("t386_-832", "solver-test"),
+            "solver-test/t386_-832/",
+        )
+
+    def test_invalid_prefix_rejected(self):
+        with self.assertRaises(RuntimeError):
+            terrain_wind.normalize_output_prefix("../wind")
+
+
 class TestFixtureTests(unittest.TestCase):
     def test_fixture_lists_both_test_areas(self):
         document = json.loads((ROOT / "fixtures" / "test-area.json").read_text(encoding="utf-8"))

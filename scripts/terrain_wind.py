@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -304,6 +305,7 @@ def resolve():
         sys.exit(1)
     if not test_mode:
         areas = expand_areas_to_tiles(areas)
+    areas = filter_areas_by_tiles(areas, tile_filter_from_env())
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps({"areas": areas}), encoding="utf-8")
     if not areas:
@@ -687,8 +689,87 @@ def windninja_env(prefix):
     return env
 
 
-def base_cfg(dem, out_dir):
-    return [
+MOMENTUM_ITERATIONS = 300
+
+
+def env_bool(name, default):
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes"):
+        return True
+    if raw in ("0", "false", "no"):
+        return False
+    raise RuntimeError(f"invalid boolean for {name}")
+
+
+def parse_csv_tokens(name):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    tokens = [part.strip() for part in raw.split(",") if part.strip()]
+    return tokens or None
+
+
+def parse_utc_hours():
+    tokens = parse_csv_tokens("TERRAIN_WIND_HOURS")
+    if tokens is None:
+        return None
+    hours = set()
+    for token in tokens:
+        try:
+            hour = int(token)
+        except ValueError:
+            raise RuntimeError(f"invalid UTC hour in TERRAIN_WIND_HOURS: {token}")
+        if hour < 0 or hour > 23:
+            raise RuntimeError(f"UTC hour out of range in TERRAIN_WIND_HOURS: {token}")
+        hours.add(hour)
+    return hours
+
+
+def normalize_output_prefix(prefix):
+    value = (prefix or "wind").strip().strip("/")
+    if not value:
+        value = "wind"
+    if value == "wind":
+        return "wind"
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
+        raise RuntimeError("TERRAIN_WIND_PREFIX is not a valid object key prefix")
+    return value
+
+
+def windninja_run_options_from_env():
+    return {
+        "diurnal": env_bool("TERRAIN_WIND_DIURNAL", True),
+        "stability": env_bool("TERRAIN_WIND_STABILITY", True),
+        "momentum": env_bool("TERRAIN_WIND_MOMENTUM", False),
+        "utc_hours": parse_utc_hours(),
+        "output_prefix": normalize_output_prefix(os.environ.get("TERRAIN_WIND_PREFIX", "wind")),
+    }
+
+
+def tile_filter_from_env():
+    tokens = parse_csv_tokens("TERRAIN_WIND_TILES")
+    if tokens is None:
+        return None
+    return set(tokens)
+
+
+def filter_areas_by_tiles(areas, tile_filter):
+    if not tile_filter:
+        return areas
+    return [area for area in areas if area["key"] in tile_filter]
+
+
+def cfg_bool(value):
+    return "true" if value else "false"
+
+
+def build_base_cfg_pairs(dem, out_dir, options):
+    diurnal = options["diurnal"]
+    stability = options["stability"]
+    momentum = options["momentum"]
+    pairs = [
         ("num_threads", "2"),
         ("elevation_file", dem),
         ("time_zone", "UTC"),
@@ -698,8 +779,8 @@ def base_cfg(dem, out_dir):
         ("vegetation", "grass"),
         ("mesh_resolution", str(CELL_M)),
         ("units_mesh_resolution", "m"),
-        ("diurnal_winds", "true"),
-        ("non_neutral_stability", "true"),
+        ("diurnal_winds", cfg_bool(diurnal)),
+        ("non_neutral_stability", cfg_bool(stability and not momentum)),
         ("write_ascii_output", "true"),
         ("ascii_out_aaigrid", "true"),
         ("ascii_out_json", "false"),
@@ -716,6 +797,42 @@ def base_cfg(dem, out_dir):
         ("write_geotiff_output", "false"),
         ("output_path", out_dir),
     ]
+    if momentum:
+        pairs.extend(
+            [
+                ("momentum_flag", "true"),
+                ("number_of_iterations", str(MOMENTUM_ITERATIONS)),
+            ]
+        )
+    return pairs
+
+
+def base_cfg(dem, out_dir, options=None):
+    if options is None:
+        options = windninja_run_options_from_env()
+    return build_base_cfg_pairs(dem, out_dir, options)
+
+
+def ensure_momentum_supported(env):
+    binary = shutil.which("WindNinja_cli", path=env["PATH"])
+    if not binary:
+        raise RuntimeError("WindNinja_cli is not installed")
+    completed = subprocess.run(
+        [binary, "--help"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    help_text = f"{completed.stdout}\n{completed.stderr}"
+    if "momentum_flag" not in help_text:
+        raise RuntimeError(
+            "TERRAIN_WIND_MOMENTUM=true but this WindNinja build does not expose momentum_flag"
+        )
+
+
+def object_prefix_for_area(area_key, output_prefix):
+    return f"{output_prefix}/{area_key}/"
 
 
 def write_cfg(path, pairs):
@@ -807,12 +924,12 @@ def find_uv(out_dir):
     return u_files[0], v_files[0]
 
 
-def solve_hour(mode, grib, dem, bbox, valid, work, env):
+def solve_hour(mode, grib, dem, bbox, valid, work, env, run_options):
     out_dir = work / "out"
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True)
-    pairs = base_cfg(dem, out_dir)
+    pairs = base_cfg(dem, out_dir, run_options)
     if mode == "wx":
         pairs[2:2] = [
             ("initialization_method", "wxModelInitialization"),
@@ -910,8 +1027,8 @@ def upload_file(
     return local.stat().st_size
 
 
-def delete_old_runs(area_key, run_stamp, env, endpoint, bucket):
-    prefix = f"wind/{area_key}/"
+def delete_old_runs(area_key, run_stamp, env, endpoint, bucket, output_prefix="wind"):
+    prefix = object_prefix_for_area(area_key, output_prefix)
     token = None
     prefixes = []
     while True:
@@ -974,7 +1091,7 @@ def delete_old_runs(area_key, run_stamp, env, endpoint, bucket):
         )
 
 
-def publish_area(area, records, run_stamp, env, endpoint, bucket):
+def publish_area(area, records, run_stamp, env, endpoint, bucket, output_prefix="wind"):
     key = area["key"]
     total = 0
     hours = []
@@ -982,26 +1099,27 @@ def publish_area(area, records, run_stamp, env, endpoint, bucket):
         body = gzip.compress(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
         local = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / f"{key}-{hour_stamp}.json.gz"
         local.write_bytes(body)
-        object_key = f"wind/{key}/{run_stamp}/{hour_stamp}.json.gz"
+        object_key = f"{output_prefix}/{key}/{run_stamp}/{hour_stamp}.json.gz"
         total += upload_file(local, object_key, env, endpoint, bucket, True)
         local.unlink(missing_ok=True)
         hours.append({"hour": hour_stamp, "file": object_key})
     index = {"v": 1, "area": key, "run": run_stamp, "hours": hours}
-    index_key = f"wind/{key}/{run_stamp}/index.json"
+    index_key = f"{output_prefix}/{key}/{run_stamp}/index.json"
     index_path = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / f"{key}-index.json"
     index_path.write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
     total += upload_file(index_path, index_key, env, endpoint, bucket, False)
     latest = {"v": 1, "area": key, "run": run_stamp, "index": index_key}
     latest_path = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / f"{key}-latest.json"
     latest_path.write_text(json.dumps(latest, indent=2) + "\n", encoding="utf-8")
-    total += upload_file(latest_path, f"wind/{key}/latest.json", env, endpoint, bucket, False)
+    total += upload_file(latest_path, f"{output_prefix}/{key}/latest.json", env, endpoint, bucket, False)
     index_path.unlink(missing_ok=True)
     latest_path.unlink(missing_ok=True)
-    delete_old_runs(key, run_stamp, env, endpoint, bucket)
+    if output_prefix == "wind":
+        delete_old_runs(key, run_stamp, env, endpoint, bucket, output_prefix)
     return total
 
 
-def process_area(area, cycle, prefix, cache_dir, storage):
+def process_area(area, cycle, prefix, cache_dir, storage, run_options):
     key = area["key"]
     bbox = area["bbox"]
     work_root = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "terrain-wind" / key
@@ -1013,19 +1131,22 @@ def process_area(area, cycle, prefix, cache_dir, storage):
     nx, ny, cell_m = grid_shape(bbox)
     mode = "wx"
     records = []
+    utc_hours = run_options["utc_hours"]
     for forecast_hour in FORECAST_HOURS:
         hour_work = work_root / f"f{forecast_hour:02d}"
         hour_work.mkdir()
         try:
             grib = hour_work / "hrrr.grib2"
             valid = fetch_hrrr_subset(cycle, forecast_hour, grib)
+            if utc_hours is not None and valid.hour not in utc_hours:
+                continue
             try:
-                u_asc, v_asc = solve_hour(mode, grib, dem, bbox, valid, hour_work, env)
+                u_asc, v_asc = solve_hour(mode, grib, dem, bbox, valid, hour_work, env, run_options)
             except Exception:
                 if mode == "wx":
                     log(f"area {key} HRRR subset not accepted; using gridded initialization")
                     mode = "gridded"
-                    u_asc, v_asc = solve_hour(mode, grib, dem, bbox, valid, hour_work, env)
+                    u_asc, v_asc = solve_hour(mode, grib, dem, bbox, valid, hour_work, env, run_options)
                 else:
                     raise
             u_values = output_grid(u_asc, bbox, nx, ny, hour_work, "u")
@@ -1048,7 +1169,7 @@ def process_area(area, cycle, prefix, cache_dir, storage):
     for hour_stamp, payload in records:
         payload["run"] = run_stamp
         finished.append((hour_stamp, payload))
-    written = publish_area(area, finished, run_stamp, *storage)
+    written = publish_area(area, finished, run_stamp, *storage, run_options["output_prefix"])
     log(f"area {key} hours={len(finished)} bytes={written} mode={mode}")
     return written
 
@@ -1060,19 +1181,26 @@ def execute():
         log("no areas source")
         return
     areas = validate_areas(json.loads(areas_path.read_text(encoding="utf-8")))
+    areas = filter_areas_by_tiles(areas, tile_filter_from_env())
     if not areas:
         log("no areas source")
         return
     storage = r2_env()
+    run_options = windninja_run_options_from_env()
     prefix = Path(os.environ.get("WINDNINJA_PREFIX", str(Path.home() / "windninja")))
+    wn_env = windninja_env(prefix)
+    if run_options["momentum"]:
+        ensure_momentum_supported(wn_env)
     cache_dir = Path(os.environ.get("DEM_CACHE", "dem-cache"))
     cycle = latest_hrrr_cycle()
     log(f"hrrr_cycle={iso(cycle)}")
+    if run_options["output_prefix"] != "wind":
+        log(f"output_prefix={run_options['output_prefix']}")
     failed = 0
     uploaded = 0
     for area in areas:
         try:
-            uploaded += process_area(area, cycle, prefix, cache_dir, storage)
+            uploaded += process_area(area, cycle, prefix, cache_dir, storage, run_options)
         except Exception as exc:
             failed += 1
             log(f"area {area['key']} failed: {scrub(exc, area['bbox'])}")
