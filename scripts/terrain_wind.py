@@ -879,7 +879,16 @@ def aws(args, env):
     run(["aws", *args], env=env, timeout=180)
 
 
-def upload_file(local, key, env, endpoint, bucket, gzip_encoding):
+def upload_file(
+    local,
+    key,
+    env,
+    endpoint,
+    bucket,
+    gzip_encoding,
+    content_type="application/json",
+    cache_control=None,
+):
     command = [
         "s3",
         "cp",
@@ -890,11 +899,13 @@ def upload_file(local, key, env, endpoint, bucket, gzip_encoding):
         "--region",
         "auto",
         "--content-type",
-        "application/json",
+        content_type,
         "--only-show-errors",
     ]
     if gzip_encoding:
         command.extend(["--content-encoding", "gzip"])
+    if cache_control:
+        command.extend(["--cache-control", cache_control])
     aws(command, env)
     return local.stat().st_size
 
