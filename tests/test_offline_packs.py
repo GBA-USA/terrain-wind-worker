@@ -103,6 +103,30 @@ class ManifestSkipTests(unittest.TestCase):
         self.assertFalse(offline_packs.manifest_is_fresh({"v": 0, "built": "2026-10-20T08:00:00Z"}, now=now))
 
 
+class PadusConstantsTests(unittest.TestCase):
+    def test_huntable_where_and_out_fields_match_app(self):
+        expected_where = " AND ".join(
+            [
+                "(Pub_Access IS NULL OR Pub_Access IN ('OA','RA','UK'))",
+                (
+                    "(Des_Tp IS NULL OR (UPPER(Des_Tp) NOT LIKE '%NATIONAL PARK%' "
+                    "AND UPPER(Des_Tp) NOT LIKE '%NATIONAL PARKS%'))"
+                ),
+                "(IUCN_Cat IS NULL OR IUCN_Cat NOT IN ('Ia','Ib'))",
+            ]
+        )
+        expected_out_fields = (
+            "Unit_Nm,Mang_Name,Mang_Type,Own_Name,Des_Tp,GIS_Acres,Pub_Access,"
+            "Access_Src,GIS_Src,State_Nm"
+        )
+        self.assertEqual(offline_packs.HUNTABLE_WHERE, expected_where)
+        self.assertEqual(offline_packs.PUBLIC_LAND_OUT_FIELDS, expected_out_fields)
+        self.assertEqual(
+            offline_packs.PADUS_QUERY_OUT_FIELDS,
+            "OBJECTID," + expected_out_fields,
+        )
+
+
 class PadusClipTests(unittest.TestCase):
     def test_polygon_crossing_bbox_produces_fill_and_edge(self):
         bbox = offline_packs.tile_bbox_wgs84(14, 4479, 6638)

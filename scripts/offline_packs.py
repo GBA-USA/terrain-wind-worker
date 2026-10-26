@@ -33,16 +33,21 @@ from terrain_wind import (
     validate_areas,
 )
 
-# Copied from IversonAcres src/lib/club/public-land-overlay.ts @ 97be3b3
-# (verify against the app repo when available to the worker token).
-HUNTABLE_WHERE = (
-    "Category IN ('Designation','Easement','Fee','NR','NP','Park','Proclamation',"
-    "'RF','RL','SMA','Wilderness') AND "
-    "(Pub_Access IN ('OA','RA') OR Pub_Access IS NULL)"
-)
+# From IversonAcres src/lib/club/public-land-overlay.ts @ 97be3b3
 PUBLIC_LAND_OUT_FIELDS = (
-    "OBJECTID,Category,Pub_Access,Mang_Type,Mang_Name,Own_Type,Own_Name,"
-    "Unit_Nm,State_Nm,GAP_Sts"
+    "Unit_Nm,Mang_Name,Mang_Type,Own_Name,Des_Tp,GIS_Acres,Pub_Access,"
+    "Access_Src,GIS_Src,State_Nm"
+)
+PADUS_QUERY_OUT_FIELDS = "OBJECTID," + PUBLIC_LAND_OUT_FIELDS
+HUNTABLE_WHERE = " AND ".join(
+    [
+        "(Pub_Access IS NULL OR Pub_Access IN ('OA','RA','UK'))",
+        (
+            "(Des_Tp IS NULL OR (UPPER(Des_Tp) NOT LIKE '%NATIONAL PARK%' "
+            "AND UPPER(Des_Tp) NOT LIKE '%NATIONAL PARKS%'))"
+        ),
+        "(IUCN_Cat IS NULL OR IUCN_Cat NOT IN ('Ia','Ib'))",
+    ]
 )
 
 MAP_TILE_URL = "https://tiles.mapterhorn.com/{z}/{x}/{y}.webp"
@@ -194,7 +199,7 @@ def padus_query_geojson(bbox):
     while True:
         params = {
             "where": HUNTABLE_WHERE,
-            "outFields": PUBLIC_LAND_OUT_FIELDS,
+            "outFields": PADUS_QUERY_OUT_FIELDS,
             "geometry": json.dumps(geometry, separators=(",", ":")),
             "geometryType": "esriGeometryEnvelope",
             "inSR": "4326",
