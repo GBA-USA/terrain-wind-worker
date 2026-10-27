@@ -84,6 +84,38 @@ Manifest example:
 
 Chunks whose manifest is missing, older than 30 days, or not `v: 1` are rebuilt. Caps: 64 chunks per area and 400 per run.
 
+## Contour tiles
+
+Separate workflow `contour-tiles` prebuilds USGS TNM contour export PNGs for wind areas (and optional client miss backfill) into R2. Triggers: weekly Monday `09:00` UTC, `workflow_dispatch` with `test=true` (fixture areas), and `repository_dispatch` type `areas-changed`. Concurrency group `contour-tiles`.
+
+Grid zoom **z = 11..15** (app map zoom 12..16 with `zoomOffset: -1`). Each object is a 512×512 PNG fetched from `carto.nationalmap.gov` using the same export query as the app (`contourTileUrl` in IversonAcres `src/lib/club/elevation.ts`), with `size=512,512`.
+
+### R2 keys
+
+```
+tiles/contours/v1/512/{z}/{x}/{y}.png
+```
+
+`Content-Type: image/png`, `Cache-Control: public, max-age=2592000`. Existing objects younger than 90 days are skipped (`HEAD` on LastModified). Caps: 3,000 tiles per run, concurrency 4, TNM retries with backoff.
+
+Optional `MISSES_URL` (same `AREAS_TOKEN` bearer): JSON `{"tiles":[[z,x,y],...]}`. When unset, the job logs `no misses source` and continues.
+
+### App read path
+
+Serve through a Cloudflare Worker route (Workers Cache API) or a custom domain on the bucket — not the rate-limited `pub-*.r2.dev` URL in production. Example path the app should request:
+
+```
+https://<your-worker-or-custom-domain>/tiles/contours/v1/512/{z}/{x}/{y}.png
+```
+
+The worker can origin-fetch from R2 using the same key layout above. Attribution: include USGS National Geospatial Program acknowledgment for contours.
+
+Dry-run tile planning (no R2):
+
+```bash
+TEST_MODE=true AREAS_FILE=fixtures/test-area.json python3 scripts/contour_tiles.py plan
+```
+
 ## License
 
 MIT. WindNinja has its own license.
