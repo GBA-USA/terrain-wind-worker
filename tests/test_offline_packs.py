@@ -86,6 +86,31 @@ class DemTileListTests(unittest.TestCase):
         self.assertEqual(len(tiles), 87)
 
 
+class PmtilesHeaderTests(unittest.TestCase):
+    def test_pmtiles_header_value_accepts_int_and_enum(self):
+        from pmtiles.tile import Compression, TileType
+
+        self.assertEqual(offline_packs.pmtiles_header_value(0, TileType), TileType.UNKNOWN)
+        self.assertEqual(
+            offline_packs.pmtiles_header_value(TileType.WEBP, TileType),
+            TileType.WEBP,
+        )
+        self.assertEqual(offline_packs.pmtiles_header_value(0, Compression), Compression.UNKNOWN)
+
+    def test_write_dem_pmtiles_finalize_with_mock_tiles(self):
+        tile_bytes = b"\x00" * 32
+
+        def fake_fetch(_z, _x, _y):
+            return tile_bytes
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dem.pmtiles"
+            with mock.patch.object(offline_packs, "fetch_tile_bytes", side_effect=fake_fetch):
+                offline_packs.write_dem_pmtiles(path, 4479, 6638)
+            self.assertGreater(path.stat().st_size, 127)
+            self.assertEqual(path.read_bytes()[:7], b"PMTiles")
+
+
 class ManifestSkipTests(unittest.TestCase):
     def test_fresh_v1_skipped(self):
         now = datetime(2026, 10, 26, tzinfo=timezone.utc)
@@ -191,14 +216,20 @@ class ManifestSchemaTests(unittest.TestCase):
             calls.append(key.split("/")[-1])
             return Path(local).stat().st_size
 
-        def write_dem(path, x, y):
-            path.write_bytes(b"dem")
+        def fake_build(x, y, work_dir):
+            dem = work_dir / "dem.pmtiles"
+            land = work_dir / "public-land.geojson"
+            manifest_path = work_dir / "manifest.json"
+            dem.write_bytes(b"dem")
+            land.write_bytes(b"{}")
+            manifest_path.write_bytes(b"{}")
+            return {}, dem.stat().st_size + land.stat().st_size + manifest_path.stat().st_size, dem, land, manifest_path
 
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp)
-            with mock.patch.object(offline_packs, "write_dem_pmtiles", side_effect=write_dem), mock.patch.object(
-                offline_packs, "padus_query_geojson", return_value={"type": "FeatureCollection", "features": []}
-            ), mock.patch.object(offline_packs, "upload_file", side_effect=fake_upload):
+            with mock.patch.object(offline_packs, "build_chunk", side_effect=fake_build), mock.patch.object(
+                offline_packs, "upload_file", side_effect=fake_upload
+            ):
                 offline_packs.upload_chunk(1, 2, work, {}, "endpoint", "bucket")
         self.assertEqual(calls, ["dem.pmtiles", "public-land.geojson", "manifest.json"])
 

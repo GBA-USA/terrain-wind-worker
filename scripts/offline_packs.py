@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from pmtiles.tile import zxy_to_tileid
+from pmtiles.tile import Compression, TileType, zxy_to_tileid
 from pmtiles.writer import write as pmtiles_write
 from shapely.geometry import LineString, mapping, shape
 
@@ -150,6 +150,14 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def pmtiles_header_value(value, enum_cls):
+    if isinstance(value, enum_cls):
+        return value
+    if isinstance(value, int):
+        return enum_cls(value)
+    raise TypeError(f"expected {enum_cls.__name__} or int, got {type(value).__name__}")
+
+
 def fetch_tile_bytes(z, x, y):
     url = MAP_TILE_URL.format(z=z, x=x, y=y)
     last_error = None
@@ -175,8 +183,8 @@ def write_dem_pmtiles(path, x14, y14):
             writer.write_tile(zxy_to_tileid(z, x, y), body)
         writer.finalize(
             {
-                "tile_type": 0,
-                "tile_compression": 0,
+                "tile_type": pmtiles_header_value(0, TileType),
+                "tile_compression": pmtiles_header_value(0, Compression),
             },
             {
                 "name": "mapterhorn-dem",
@@ -416,8 +424,7 @@ def resolve():
     log(f"areas={len(areas)}")
 
 
-def upload_chunk(x, y, work_dir, env, endpoint, bucket):
-    prefix = f"packs/v1/z14/{x}/{y}"
+def build_chunk(x, y, work_dir):
     dem_path = work_dir / "dem.pmtiles"
     land_path = work_dir / "public-land.geojson"
     bbox = tile_bbox_wgs84(CHUNK_Z, x, y)
@@ -432,6 +439,13 @@ def upload_chunk(x, y, work_dir, env, endpoint, bucket):
     manifest = manifest_for_chunk(x, y, bbox, built, dem_path, land_path, len(features))
     manifest_path = work_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    local_bytes = dem_path.stat().st_size + land_path.stat().st_size + manifest_path.stat().st_size
+    return manifest, local_bytes, dem_path, land_path, manifest_path
+
+
+def upload_chunk(x, y, work_dir, env, endpoint, bucket):
+    prefix = f"packs/v1/z14/{x}/{y}"
+    manifest, _local_bytes, dem_path, land_path, manifest_path = build_chunk(x, y, work_dir)
 
     total = 0
     total += upload_file(
@@ -475,9 +489,15 @@ def execute():
         log("no areas source")
         return
 
-    storage = r2_env()
-    env, endpoint, bucket = storage
+    test_mode = os.environ.get("TEST_MODE", "").strip().lower() == "true"
+    if test_mode:
+        env, endpoint, bucket = None, None, None
+    else:
+        storage = r2_env()
+        env, endpoint, bucket = storage
     chunks = collect_chunks(areas)
+    if test_mode:
+        chunks = chunks[:1]
     log(f"chunks_planned={len(chunks)}")
 
     built = 0
@@ -487,7 +507,7 @@ def execute():
     work_root = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "offline-packs"
 
     for x, y in chunks:
-        if should_skip_chunk(x, y, env, endpoint, bucket):
+        if not test_mode and should_skip_chunk(x, y, env, endpoint, bucket):
             skipped += 1
             continue
         work_dir = work_root / f"{x}-{y}"
@@ -495,7 +515,10 @@ def execute():
             shutil.rmtree(work_dir)
         work_dir.mkdir(parents=True)
         try:
-            chunk_bytes, _manifest = upload_chunk(x, y, work_dir, env, endpoint, bucket)
+            if test_mode:
+                _manifest, chunk_bytes, *_paths = build_chunk(x, y, work_dir)
+            else:
+                chunk_bytes, _manifest = upload_chunk(x, y, work_dir, env, endpoint, bucket)
             uploaded_bytes += chunk_bytes
             built += 1
             log(f"chunk built bytes={chunk_bytes}")
