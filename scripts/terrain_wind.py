@@ -26,6 +26,20 @@ DEM_URL = (
     "3DEPElevation/ImageServer/exportImage"
 )
 FORECAST_HOURS = range(1, 19)
+HRRR_SUBSET_VARIABLES = frozenset(
+    {"TMP", "UGRD", "VGRD", "TCDC", "RH", "DPT", "WIND", "PRATE", "DSWRF"}
+)
+# Scalar weather keys match IversonAcres src/lib/club/scent-weather.server.ts (Open-Meteo units).
+SCENT_WEATHER_KEYS = (
+    "cloud_cover",
+    "relative_humidity_2m",
+    "dew_point_2m",
+    "temperature_2m",
+    "wind_gusts_10m",
+    "precipitation",
+    "shortwave_radiation",
+    "weather_code",
+)
 MAX_EDGE_KM = 40
 TILE_EPS = 1e-9
 TILE_CAP = 60
@@ -437,13 +451,7 @@ def hrrr_object(cycle, forecast_hour):
     )
 
 
-def fetch_hrrr_subset(cycle, forecast_hour, dest):
-    url = hrrr_object(cycle, forecast_hour)
-    try:
-        index_text = http_bytes(url + ".idx", timeout=60)[0].decode("utf-8", "replace")
-        size = content_length(url)
-    except Exception:
-        raise RuntimeError("HRRR download failed") from None
+def parse_hrrr_idx_rows(index_text):
     rows = []
     for line in index_text.splitlines():
         parts = line.split(":")
@@ -453,22 +461,70 @@ def fetch_hrrr_subset(cycle, forecast_hour, dest):
             start = int(parts[1])
         except ValueError:
             continue
-        rows.append((start, parts[3], parts[4]))
-    wanted = []
-    for index, (start, variable, level) in enumerate(rows):
-        take = (
-            (variable == "TMP" and level.startswith("2 m above ground"))
-            or (variable in ("UGRD", "VGRD") and level.startswith("10 m above ground"))
-            or (variable == "TCDC" and level.startswith("entire atmosphere"))
+        rows.append(
+            {
+                "start": start,
+                "variable": parts[3],
+                "level": parts[4],
+                "desc": parts[5] if len(parts) > 5 else "",
+            }
         )
-        if not take:
+    return rows
+
+
+def hrrr_message_selected(row):
+    variable = row["variable"]
+    level = row["level"]
+    desc = row["desc"]
+    if variable == "TMP" and level.startswith("2 m above ground") and "max" not in desc:
+        return True
+    if variable in ("UGRD", "VGRD") and level.startswith("10 m above ground") and "max" not in desc:
+        return True
+    if variable == "WIND" and level.startswith("10 m above ground") and "max" in desc:
+        return True
+    if variable == "TCDC" and level == "entire atmosphere":
+        return True
+    if variable in ("RH", "DPT") and level.startswith("2 m above ground"):
+        return True
+    if variable in ("PRATE", "DSWRF") and level.startswith("surface"):
+        return True
+    return False
+
+
+def hrrr_subset_ranges(rows, file_size):
+    wanted = []
+    for index, row in enumerate(rows):
+        if not hrrr_message_selected(row):
             continue
-        end = rows[index + 1][0] - 1 if index + 1 < len(rows) else size - 1
-        wanted.append((variable, start, end))
+        end = rows[index + 1]["start"] - 1 if index + 1 < len(rows) else file_size - 1
+        wanted.append((row["variable"], row["start"], end))
     names = {item[0] for item in wanted}
-    if names != {"TMP", "UGRD", "VGRD", "TCDC"}:
-        raise RuntimeError("HRRR subset is missing 10 m wind, 2 m temperature, or cloud cover")
-    order = {"TMP": 0, "UGRD": 1, "VGRD": 2, "TCDC": 3}
+    if names != set(HRRR_SUBSET_VARIABLES):
+        missing = sorted(set(HRRR_SUBSET_VARIABLES) - names)
+        raise RuntimeError(f"HRRR subset is missing required fields: {', '.join(missing)}")
+    return wanted
+
+
+def fetch_hrrr_subset(cycle, forecast_hour, dest):
+    url = hrrr_object(cycle, forecast_hour)
+    try:
+        index_text = http_bytes(url + ".idx", timeout=60)[0].decode("utf-8", "replace")
+        size = content_length(url)
+    except Exception:
+        raise RuntimeError("HRRR download failed") from None
+    rows = parse_hrrr_idx_rows(index_text)
+    wanted = hrrr_subset_ranges(rows, size)
+    order = {
+        "TMP": 0,
+        "DPT": 1,
+        "RH": 2,
+        "UGRD": 3,
+        "VGRD": 4,
+        "WIND": 5,
+        "PRATE": 6,
+        "TCDC": 7,
+        "DSWRF": 8,
+    }
     blob = b""
     try:
         for _variable, start, end in sorted(wanted, key=lambda item: order[item[0]]):
@@ -481,7 +537,7 @@ def fetch_hrrr_subset(cycle, forecast_hour, dest):
     except Exception:
         raise RuntimeError("HRRR download failed") from None
     dest.write_bytes(blob)
-    return cycle + timedelta(hours=forecast_hour)
+    return cycle + timedelta(hours=forecast_hour), len(blob)
 
 
 def read_asc(path):
@@ -669,17 +725,88 @@ def build_speed_dir(grib, dem, bbox, work):
     return speed_path, dir_path, fill_speed
 
 
-def surface_means(grib, bbox, work):
+def normalize_temperature_c(value):
+    if value > 150.0:
+        value -= 273.15
+    return round(value, 1)
+
+
+def normalize_cloud_cover_percent(value):
+    if value <= 1.5:
+        value *= 100.0
+    return round(max(0.0, min(100.0, value)), 1)
+
+
+def normalize_prate_mm_per_hour(value):
+    return round(max(0.0, value) * 3600.0, 2)
+
+
+def round_scalar(value, places=1):
+    return round(value, places)
+
+
+def derive_weather_code(precip_mm_h, cloud_cover, temp_c):
+    if precip_mm_h >= 1.0:
+        if temp_c < 0.0:
+            return 71
+        if precip_mm_h >= 5.0:
+            return 65
+        return 61
+    if precip_mm_h >= 0.1:
+        return 51
+    if cloud_cover >= 90.0:
+        return 3
+    if cloud_cover >= 50.0:
+        return 2
+    if cloud_cover >= 20.0:
+        return 1
+    return 0
+
+
+def scent_weather_payload(
+    cloud_cover,
+    relative_humidity_2m,
+    dew_point_2m,
+    temperature_2m,
+    wind_gusts_10m,
+    precipitation,
+    shortwave_radiation,
+):
+    cloud_cover = normalize_cloud_cover_percent(cloud_cover)
+    temperature_2m = normalize_temperature_c(temperature_2m)
+    dew_point_2m = normalize_temperature_c(dew_point_2m)
+    precipitation = normalize_prate_mm_per_hour(precipitation)
+    payload = {
+        "cloud_cover": cloud_cover,
+        "relative_humidity_2m": round_scalar(relative_humidity_2m),
+        "dew_point_2m": dew_point_2m,
+        "temperature_2m": temperature_2m,
+        "wind_gusts_10m": round_scalar(wind_gusts_10m),
+        "precipitation": precipitation,
+        "shortwave_radiation": round_scalar(shortwave_radiation),
+        "weather_code": derive_weather_code(precipitation, cloud_cover, temperature_2m),
+    }
+    for key in SCENT_WEATHER_KEYS:
+        if key not in payload:
+            raise RuntimeError("scent weather payload is incomplete")
+    return payload
+
+
+def weather_from_grib(grib, bbox, work):
     info = gdal_info(grib)
-    temp_band = band_number(info, "Temperature", "2-HTGL")
-    cloud_band = band_number(info, "Total cloud cover", "0-EATM")
-    temp = sample_band_mean(grib, temp_band, bbox, work)
-    cloud = sample_band_mean(grib, cloud_band, bbox, work)
-    if temp > 150.0:
-        temp -= 273.15
-    if cloud <= 1.5:
-        cloud *= 100.0
-    return temp, max(0.0, min(100.0, cloud))
+    temp = sample_band_mean(grib, band_number(info, "Temperature", "2-HTGL"), bbox, work)
+    dew = sample_band_mean(grib, band_number(info, "Dew point temperature", "2-HTGL"), bbox, work)
+    rh = sample_band_mean(grib, band_number(info, "Relative humidity", "2-HTGL"), bbox, work)
+    gust = sample_band_mean(grib, band_number(info, "Wind speed", "10-HTGL"), bbox, work)
+    precip = sample_band_mean(grib, band_number(info, "Precipitation rate", "0-SFC"), bbox, work)
+    cloud = sample_band_mean(grib, band_number(info, "Total cloud cover", "0-EATM"), bbox, work)
+    shortwave = sample_band_mean(grib, band_number(info, "Downward short-wave radiation flux", "0-SFC"), bbox, work)
+    return scent_weather_payload(cloud, rh, dew, temp, gust, precip, shortwave)
+
+
+def surface_means(grib, bbox, work):
+    weather = weather_from_grib(grib, bbox, work)
+    return weather["temperature_2m"], weather["cloud_cover"]
 
 
 def windninja_env(prefix):
@@ -857,8 +984,19 @@ def sanitize_resampled_values(values, nodata):
     return cleaned
 
 
-def hour_record_payload(area_key, hour_stamp, bbox, nx, ny, cell_m, u_values, v_values, run_stamp=None):
-    return {
+def hour_record_payload(
+    area_key,
+    hour_stamp,
+    bbox,
+    nx,
+    ny,
+    cell_m,
+    u_values,
+    v_values,
+    run_stamp=None,
+    weather=None,
+):
+    record = {
         "ver": 1,
         "area": area_key,
         "run": run_stamp,
@@ -870,6 +1008,9 @@ def hour_record_payload(area_key, hour_stamp, bbox, nx, ny, cell_m, u_values, v_
         "u": u_values,
         "v": v_values,
     }
+    if weather is not None:
+        record["weather"] = weather
+    return record
 
 
 def output_grid(asc_path, bbox, nx, ny, work, name):
@@ -1102,7 +1243,11 @@ def publish_area(area, records, run_stamp, env, endpoint, bucket, output_prefix=
         object_key = f"{output_prefix}/{key}/{run_stamp}/{hour_stamp}.json.gz"
         total += upload_file(local, object_key, env, endpoint, bucket, True)
         local.unlink(missing_ok=True)
-        hours.append({"hour": hour_stamp, "file": object_key})
+        hour_index = {"hour": hour_stamp, "file": object_key}
+        weather = payload.get("weather")
+        if weather is not None:
+            hour_index["weather"] = weather
+        hours.append(hour_index)
     index = {"v": 1, "area": key, "run": run_stamp, "hours": hours}
     index_key = f"{output_prefix}/{key}/{run_stamp}/index.json"
     index_path = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / f"{key}-index.json"
@@ -1132,14 +1277,17 @@ def process_area(area, cycle, prefix, cache_dir, storage, run_options):
     mode = "wx"
     records = []
     utc_hours = run_options["utc_hours"]
+    hrrr_bytes = 0
     for forecast_hour in FORECAST_HOURS:
         hour_work = work_root / f"f{forecast_hour:02d}"
         hour_work.mkdir()
         try:
             grib = hour_work / "hrrr.grib2"
-            valid = fetch_hrrr_subset(cycle, forecast_hour, grib)
+            valid, subset_bytes = fetch_hrrr_subset(cycle, forecast_hour, grib)
             if utc_hours is not None and valid.hour not in utc_hours:
                 continue
+            hrrr_bytes += subset_bytes
+            weather = weather_from_grib(grib, bbox, hour_work)
             try:
                 u_asc, v_asc = solve_hour(mode, grib, dem, bbox, valid, hour_work, env, run_options)
             except Exception:
@@ -1155,7 +1303,17 @@ def process_area(area, cycle, prefix, cache_dir, storage, run_options):
             records.append(
                 (
                     hour_stamp,
-                    hour_record_payload(key, hour_stamp, bbox, nx, ny, cell_m, u_values, v_values),
+                    hour_record_payload(
+                        key,
+                        hour_stamp,
+                        bbox,
+                        nx,
+                        ny,
+                        cell_m,
+                        u_values,
+                        v_values,
+                        weather=weather,
+                    ),
                 )
             )
         except Exception as exc:
@@ -1170,7 +1328,11 @@ def process_area(area, cycle, prefix, cache_dir, storage, run_options):
         payload["run"] = run_stamp
         finished.append((hour_stamp, payload))
     written = publish_area(area, finished, run_stamp, *storage, run_options["output_prefix"])
-    log(f"area {key} hours={len(finished)} bytes={written} mode={mode}")
+    per_hour = hrrr_bytes / len(finished) if finished else 0
+    log(
+        f"area {key} hours={len(finished)} bytes={written} mode={mode} "
+        f"hrrr_bytes={hrrr_bytes} hrrr_bytes_per_hour={per_hour:.0f}"
+    )
     return written
 
 
