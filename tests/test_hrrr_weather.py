@@ -26,6 +26,7 @@ class HrrrIdxSelectionTests(unittest.TestCase):
                 "78:53666458:d=2026102712:VGRD:10 m above ground:1 hour fcst:",
                 "79:56048073:d=2026102712:WIND:10 m above ground:0-1 hour max fcst:",
                 "83:60150527:d=2026102712:PRATE:surface:1 hour fcst:",
+                "113:79643399:d=2026102712:LCDC:low cloud layer:1 hour fcst:",
                 "116:81325983:d=2026102712:TCDC:entire atmosphere:1 hour fcst:",
                 "123:90837547:d=2026102712:DSWRF:surface:1 hour fcst:",
             ]
@@ -56,15 +57,16 @@ class HrrrIdxSelectionTests(unittest.TestCase):
 
 class ScentWeatherPayloadTests(unittest.TestCase):
     def test_contract_keys_and_units(self):
-        payload = terrain_wind.scent_weather_payload(0.42, 68.2, 285.0, 292.0, 4.2, 0.0001, 512.0)
+        payload = terrain_wind.scent_weather_payload(0.42, 0.25, 68.2, 285.0, 292.0, 4.2, 0.0001, 512.0)
         self.assertEqual(list(payload.keys()), CONTRACT["keys"])
-        self.assertEqual(payload["cloud_cover"], 42.0)
-        self.assertEqual(payload["temperature_2m"], 18.9)
-        self.assertEqual(payload["dew_point_2m"], 11.9)
-        self.assertEqual(payload["precipitation"], 0.36)
-        self.assertEqual(payload["relative_humidity_2m"], 68.2)
-        self.assertEqual(payload["wind_gusts_10m"], 4.2)
-        self.assertEqual(payload["shortwave_radiation"], 512.0)
+        self.assertEqual(payload["cloud_pct"], 42.0)
+        self.assertEqual(payload["cloud_low_pct"], 25.0)
+        self.assertEqual(payload["temperature_c"], 18.9)
+        self.assertEqual(payload["dew_point_c"], 11.9)
+        self.assertEqual(payload["precip_mm_per_h"], 0.36)
+        self.assertEqual(payload["relative_humidity_pct"], 68.2)
+        self.assertEqual(payload["gust_mph"], round(4.2 * terrain_wind.MPS_TO_MPH, 1))
+        self.assertEqual(payload["shortwave_wm2"], 512.0)
         self.assertIsInstance(payload["weather_code"], int)
 
     def test_derive_weather_code(self):
@@ -74,7 +76,7 @@ class ScentWeatherPayloadTests(unittest.TestCase):
         self.assertEqual(terrain_wind.derive_weather_code(1.5, 40.0, -2.0), 71)
 
     def test_hour_record_includes_weather(self):
-        weather = terrain_wind.scent_weather_payload(50.0, 70.0, 280.0, 290.0, 3.0, 0.0, 400.0)
+        weather = terrain_wind.scent_weather_payload(50.0, 20.0, 70.0, 280.0, 290.0, 3.0, 0.0, 400.0)
         payload = terrain_wind.hour_record_payload(
             "t322_-816",
             "2026-10-25T12:00:00Z",
@@ -95,6 +97,11 @@ class WeatherFromGribTests(unittest.TestCase):
         grib = Path("/tmp/hrrr-subset.grib2")
         if not grib.is_file():
             self.skipTest("local HRRR subset fixture not present")
+        info = terrain_wind.gdal_info(grib)
+        try:
+            terrain_wind.band_number(info, "Low cloud cover", "0-LCY")
+        except RuntimeError:
+            self.skipTest("local HRRR subset fixture predates LCDC")
         bbox = [-98.0, 30.0, -97.0, 31.0]
         with tempfile.TemporaryDirectory() as tmp:
             weather = terrain_wind.weather_from_grib(grib, bbox, Path(tmp))

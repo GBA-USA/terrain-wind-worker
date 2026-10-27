@@ -35,12 +35,12 @@ S3 endpoint `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`, region `auto`. I
 Hour JSON:
 
 ```json
-{"ver":1,"area":"<key>","run":"<ISO-8601>","hour":"<ISO-8601>","bbox":[minLon,minLat,maxLon,maxLat],"nx":0,"ny":0,"cell_m":100,"u":[],"v":[],"weather":{"cloud_cover":0,"relative_humidity_2m":0,"dew_point_2m":0,"temperature_2m":0,"wind_gusts_10m":0,"precipitation":0,"shortwave_radiation":0,"weather_code":0}}
+{"ver":1,"area":"<key>","run":"<ISO-8601>","hour":"<ISO-8601>","bbox":[minLon,minLat,maxLon,maxLat],"nx":0,"ny":0,"cell_m":100,"u":[],"v":[],"weather":{"cloud_pct":0,"cloud_low_pct":0,"relative_humidity_pct":0,"dew_point_c":0,"temperature_c":0,"gust_mph":0,"precip_mm_per_h":0,"shortwave_wm2":0,"weather_code":0}}
 ```
 
 `u` (east) and `v` (north) are m/s rounded to 0.1, row-major from the northwest corner; cells with no data are JSON `null`. Timestamps are UTC `YYYY-MM-DDTHH:MM:SSZ`. Runs older than 48 hours are deleted.
 
-`weather` holds area-mean HRRR scalars for scent alerts (same keys as IversonAcres `scent-weather.server.ts`): cloud cover %, 2 m RH/dew point/temperature (°C), 10 m max wind (m/s), precipitation (mm/h), downward shortwave (W/m²), and a derived WMO-style `weather_code`. Each `index.json` hour entry repeats the same object inline as `weather` (scalars are small; no `weather_file` sidecar).
+`weather` holds area-mean HRRR scalars for scent alerts (same keys as IversonAcres `scent-weather.server.ts`): `cloud_pct`, `cloud_low_pct` (LCDC), `relative_humidity_pct`, `dew_point_c`, `temperature_c`, `gust_mph`, `precip_mm_per_h`, `shortwave_wm2`, and WMO `weather_code`. Each `index.json` hour entry repeats the same object inline as `weather` (scalars are small; no `weather_file` sidecar).
 
 Each hour uses NOAA HRRR 10 m wind plus those scalar fields (AWS Open Data GRIB `.idx` byte ranges), a USGS 3DEP DEM cached by area key, and WindNinja with diurnal winds and non-neutral stability.
 

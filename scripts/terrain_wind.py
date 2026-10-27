@@ -27,19 +27,21 @@ DEM_URL = (
 )
 FORECAST_HOURS = range(1, 19)
 HRRR_SUBSET_VARIABLES = frozenset(
-    {"TMP", "UGRD", "VGRD", "TCDC", "RH", "DPT", "WIND", "PRATE", "DSWRF"}
+    {"TMP", "UGRD", "VGRD", "TCDC", "LCDC", "RH", "DPT", "WIND", "PRATE", "DSWRF"}
 )
-# Scalar weather keys match IversonAcres src/lib/club/scent-weather.server.ts (Open-Meteo units).
+# Scalar weather keys match IversonAcres src/lib/club/scent-weather.server.ts.
 SCENT_WEATHER_KEYS = (
-    "cloud_cover",
-    "relative_humidity_2m",
-    "dew_point_2m",
-    "temperature_2m",
-    "wind_gusts_10m",
-    "precipitation",
-    "shortwave_radiation",
+    "cloud_pct",
+    "cloud_low_pct",
+    "relative_humidity_pct",
+    "dew_point_c",
+    "temperature_c",
+    "gust_mph",
+    "precip_mm_per_h",
+    "shortwave_wm2",
     "weather_code",
 )
+MPS_TO_MPH = 2.2369362920544
 MAX_EDGE_KM = 40
 TILE_EPS = 1e-9
 TILE_CAP = 60
@@ -484,6 +486,8 @@ def hrrr_message_selected(row):
         return True
     if variable == "TCDC" and level == "entire atmosphere":
         return True
+    if variable == "LCDC" and level == "low cloud layer":
+        return True
     if variable in ("RH", "DPT") and level.startswith("2 m above ground"):
         return True
     if variable in ("PRATE", "DSWRF") and level.startswith("surface"):
@@ -523,7 +527,8 @@ def fetch_hrrr_subset(cycle, forecast_hour, dest):
         "WIND": 5,
         "PRATE": 6,
         "TCDC": 7,
-        "DSWRF": 8,
+        "LCDC": 8,
+        "DSWRF": 9,
     }
     blob = b""
     try:
@@ -764,27 +769,31 @@ def derive_weather_code(precip_mm_h, cloud_cover, temp_c):
 
 
 def scent_weather_payload(
-    cloud_cover,
-    relative_humidity_2m,
-    dew_point_2m,
-    temperature_2m,
-    wind_gusts_10m,
-    precipitation,
-    shortwave_radiation,
+    cloud_pct,
+    cloud_low_pct,
+    relative_humidity_pct,
+    dew_point_c,
+    temperature_c,
+    gust_mps,
+    precip_rate,
+    shortwave_wm2,
 ):
-    cloud_cover = normalize_cloud_cover_percent(cloud_cover)
-    temperature_2m = normalize_temperature_c(temperature_2m)
-    dew_point_2m = normalize_temperature_c(dew_point_2m)
-    precipitation = normalize_prate_mm_per_hour(precipitation)
+    cloud_pct = normalize_cloud_cover_percent(cloud_pct)
+    cloud_low_pct = normalize_cloud_cover_percent(cloud_low_pct)
+    temperature_c = normalize_temperature_c(temperature_c)
+    dew_point_c = normalize_temperature_c(dew_point_c)
+    precip_mm_per_h = normalize_prate_mm_per_hour(precip_rate)
+    gust_mph = round_scalar(gust_mps * MPS_TO_MPH)
     payload = {
-        "cloud_cover": cloud_cover,
-        "relative_humidity_2m": round_scalar(relative_humidity_2m),
-        "dew_point_2m": dew_point_2m,
-        "temperature_2m": temperature_2m,
-        "wind_gusts_10m": round_scalar(wind_gusts_10m),
-        "precipitation": precipitation,
-        "shortwave_radiation": round_scalar(shortwave_radiation),
-        "weather_code": derive_weather_code(precipitation, cloud_cover, temperature_2m),
+        "cloud_pct": cloud_pct,
+        "cloud_low_pct": cloud_low_pct,
+        "relative_humidity_pct": round_scalar(relative_humidity_pct),
+        "dew_point_c": dew_point_c,
+        "temperature_c": temperature_c,
+        "gust_mph": gust_mph,
+        "precip_mm_per_h": precip_mm_per_h,
+        "shortwave_wm2": round_scalar(shortwave_wm2),
+        "weather_code": derive_weather_code(precip_mm_per_h, cloud_pct, temperature_c),
     }
     for key in SCENT_WEATHER_KEYS:
         if key not in payload:
@@ -800,13 +809,14 @@ def weather_from_grib(grib, bbox, work):
     gust = sample_band_mean(grib, band_number(info, "Wind speed", "10-HTGL"), bbox, work)
     precip = sample_band_mean(grib, band_number(info, "Precipitation rate", "0-SFC"), bbox, work)
     cloud = sample_band_mean(grib, band_number(info, "Total cloud cover", "0-EATM"), bbox, work)
+    cloud_low = sample_band_mean(grib, band_number(info, "Low cloud cover", "0-LCY"), bbox, work)
     shortwave = sample_band_mean(grib, band_number(info, "Downward short-wave radiation flux", "0-SFC"), bbox, work)
-    return scent_weather_payload(cloud, rh, dew, temp, gust, precip, shortwave)
+    return scent_weather_payload(cloud, cloud_low, rh, dew, temp, gust, precip, shortwave)
 
 
 def surface_means(grib, bbox, work):
     weather = weather_from_grib(grib, bbox, work)
-    return weather["temperature_2m"], weather["cloud_cover"]
+    return weather["temperature_c"], weather["cloud_pct"]
 
 
 def windninja_env(prefix):

@@ -1,23 +1,25 @@
 {
-  "description": "Scalar weather object written to hour JSON (weather) and run index hours[].weather. Keys align with IversonAcres src/lib/club/scent-weather.server.ts.",
+  "description": "Scalar weather object written to hour JSON (weather) and run index hours[].weather. Keys match IversonAcres src/lib/club/scent-weather.server.ts.",
   "keys": [
-    "cloud_cover",
-    "relative_humidity_2m",
-    "dew_point_2m",
-    "temperature_2m",
-    "wind_gusts_10m",
-    "precipitation",
-    "shortwave_radiation",
+    "cloud_pct",
+    "cloud_low_pct",
+    "relative_humidity_pct",
+    "dew_point_c",
+    "temperature_c",
+    "gust_mph",
+    "precip_mm_per_h",
+    "shortwave_wm2",
     "weather_code"
   ],
   "units": {
-    "cloud_cover": "percent",
-    "relative_humidity_2m": "percent",
-    "dew_point_2m": "celsius",
-    "temperature_2m": "celsius",
-    "wind_gusts_10m": "m/s",
-    "precipitation": "mm/h",
-    "shortwave_radiation": "W/m^2",
-    "weather_code": "WMO (Open-Meteo style)"
+    "cloud_pct": "percent",
+    "cloud_low_pct": "percent (HRRR LCDC low cloud layer)",
+    "relative_humidity_pct": "percent",
+    "dew_point_c": "celsius",
+    "temperature_c": "celsius",
+    "gust_mph": "mph (from 10 m max wind m/s)",
+    "precip_mm_per_h": "mm/h",
+    "shortwave_wm2": "W/m^2",
+    "weather_code": "WMO"
   }
 }
