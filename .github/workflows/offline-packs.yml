@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install pack dependencies
-        run: pip install pmtiles shapely
+        run: pip install "pmtiles==3.8.1" shapely
 
       - name: Resolve areas
         id: areas
