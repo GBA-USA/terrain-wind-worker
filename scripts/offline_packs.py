@@ -480,67 +480,90 @@ def upload_chunk(x, y, work_dir, env, endpoint, bucket):
 
 
 def execute():
-    areas_path = Path(os.environ.get("AREAS_FILE", "areas.json"))
-    if not areas_path.is_file():
-        log("no areas source")
-        return
-    areas = validate_areas(json.loads(areas_path.read_text(encoding="utf-8")))
-    if not areas:
-        log("no areas source")
-        return
+    from run_status import RunStatusReporter
 
-    test_mode = os.environ.get("TEST_MODE", "").strip().lower() == "true"
-    if test_mode:
-        env, endpoint, bucket = None, None, None
-    else:
-        storage = r2_env()
-        env, endpoint, bucket = storage
-    chunks = collect_chunks(areas)
-    if test_mode:
-        chunks = chunks[:1]
-    log(f"chunks_planned={len(chunks)}")
+    status = RunStatusReporter("offline-packs")
+    status.start()
+    conclusion = "success"
+    exit_code = 0
+    status_fields = {
+        "chunks_built": 0,
+        "chunks_skipped": 0,
+        "chunks_failed": 0,
+        "uploaded_mb": 0.0,
+    }
+    try:
+        areas_path = Path(os.environ.get("AREAS_FILE", "areas.json"))
+        if not areas_path.is_file():
+            log("no areas source")
+            return
+        areas = validate_areas(json.loads(areas_path.read_text(encoding="utf-8")))
+        if not areas:
+            log("no areas source")
+            return
 
-    built = 0
-    skipped = 0
-    failed = 0
-    uploaded_bytes = 0
-    work_root = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "offline-packs"
+        test_mode = os.environ.get("TEST_MODE", "").strip().lower() == "true"
+        if test_mode:
+            env, endpoint, bucket = None, None, None
+        else:
+            storage = r2_env()
+            env, endpoint, bucket = storage
+        chunks = collect_chunks(areas)
+        if test_mode:
+            chunks = chunks[:1]
+        log(f"chunks_planned={len(chunks)}")
 
-    for x, y in chunks:
-        if not test_mode and should_skip_chunk(x, y, env, endpoint, bucket):
-            skipped += 1
-            continue
-        work_dir = work_root / f"{x}-{y}"
-        if work_dir.exists():
-            shutil.rmtree(work_dir)
-        work_dir.mkdir(parents=True)
-        try:
-            if test_mode:
-                _manifest, chunk_bytes, *_paths = build_chunk(x, y, work_dir)
-            else:
-                chunk_bytes, _manifest = upload_chunk(x, y, work_dir, env, endpoint, bucket)
-            uploaded_bytes += chunk_bytes
-            built += 1
-            log(f"chunk built bytes={chunk_bytes}")
-        except Exception as exc:
-            failed += 1
-            log(f"chunk failed: {scrub(exc, tile_bbox_wgs84(CHUNK_Z, x, y))}")
-        finally:
-            shutil.rmtree(work_dir, ignore_errors=True)
+        built = 0
+        skipped = 0
+        failed = 0
+        uploaded_bytes = 0
+        work_root = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "offline-packs"
 
-    log(
-        f"chunks_built={built} chunks_skipped={skipped} chunks_failed={failed} "
-        f"uploaded_mb={uploaded_bytes / 1_000_000:.3f}"
-    )
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary:
-        with open(summary, "a", encoding="utf-8") as handle:
-            handle.write(
-                f"chunks_built={built} chunks_skipped={skipped} chunks_failed={failed} "
-                f"uploaded_mb={uploaded_bytes / 1_000_000:.3f}\n"
-            )
-    if failed:
-        sys.exit(1)
+        for x, y in chunks:
+            if not test_mode and should_skip_chunk(x, y, env, endpoint, bucket):
+                skipped += 1
+                continue
+            work_dir = work_root / f"{x}-{y}"
+            if work_dir.exists():
+                shutil.rmtree(work_dir)
+            work_dir.mkdir(parents=True)
+            try:
+                if test_mode:
+                    _manifest, chunk_bytes, *_paths = build_chunk(x, y, work_dir)
+                else:
+                    chunk_bytes, _manifest = upload_chunk(x, y, work_dir, env, endpoint, bucket)
+                uploaded_bytes += chunk_bytes
+                built += 1
+                log(f"chunk built bytes={chunk_bytes}")
+            except Exception as exc:
+                failed += 1
+                log(f"chunk failed: {scrub(exc, tile_bbox_wgs84(CHUNK_Z, x, y))}")
+            finally:
+                shutil.rmtree(work_dir, ignore_errors=True)
+
+        status_fields["chunks_built"] = built
+        status_fields["chunks_skipped"] = skipped
+        status_fields["chunks_failed"] = failed
+        status_fields["uploaded_mb"] = round(uploaded_bytes / 1_000_000.0, 3)
+
+        log(
+            f"chunks_built={built} chunks_skipped={skipped} chunks_failed={failed} "
+            f"uploaded_mb={uploaded_bytes / 1_000_000:.3f}"
+        )
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            with open(summary, "a", encoding="utf-8") as handle:
+                handle.write(
+                    f"chunks_built={built} chunks_skipped={skipped} chunks_failed={failed} "
+                    f"uploaded_mb={uploaded_bytes / 1_000_000:.3f}\n"
+                )
+        if failed:
+            exit_code = 1
+            conclusion = "partial" if built else "failure"
+    finally:
+        status.finish(conclusion, **status_fields)
+    if exit_code:
+        sys.exit(exit_code)
 
 
 def main():

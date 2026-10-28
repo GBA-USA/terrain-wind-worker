@@ -62,6 +62,7 @@ jobs:
       TERRAIN_WIND_HOURS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.hours || '' }}
       TERRAIN_WIND_PREFIX: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prefix || 'wind' }}
       DEM_CACHE: ${{ github.workspace }}/dem-cache
+      RUN_TIMEOUT_S: "3600"
     steps:
       - uses: actions/checkout@v4
 

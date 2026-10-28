@@ -31,6 +31,7 @@ jobs:
       AREAS_URL: ${{ secrets.AREAS_URL }}
       AREAS_TOKEN: ${{ secrets.AREAS_TOKEN }}
       TEST_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.test == 'true' }}
+      RUN_TIMEOUT_S: "3600"
     steps:
       - uses: actions/checkout@v4
 
