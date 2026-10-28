@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from pmtiles.tile import Compression, TileType, zxy_to_tileid
 from pmtiles.writer import write as pmtiles_write
-from shapely.geometry import LineString, mapping, shape
+from shapely.geometry import GeometryCollection, LineString, MultiPolygon, Polygon, mapping, shape
 
 from terrain_wind import (
     buffer_bbox,
@@ -231,6 +231,42 @@ def padus_query_geojson(bbox):
     return {"type": "FeatureCollection", "features": features}
 
 
+def _make_valid_geom(geom):
+    try:
+        from shapely import make_valid
+    except ImportError:
+        make_valid = None
+    if make_valid is not None:
+        return make_valid(geom)
+    return geom.buffer(0)
+
+
+def _polygonal_parts(geom):
+    if geom.is_empty:
+        return geom
+    if isinstance(geom, (Polygon, MultiPolygon)):
+        return geom
+    if isinstance(geom, GeometryCollection):
+        polys = []
+        for part in geom.geoms:
+            if isinstance(part, Polygon):
+                polys.append(part)
+            elif isinstance(part, MultiPolygon):
+                polys.extend(part.geoms)
+        if not polys:
+            return GeometryCollection()
+        if len(polys) == 1:
+            return polys[0]
+        return MultiPolygon(polys)
+    return GeometryCollection()
+
+
+def _prepare_geom_for_clip(geom):
+    if geom.is_valid:
+        return geom
+    return _polygonal_parts(_make_valid_geom(geom))
+
+
 def clip_bbox_geom(geom, bbox):
     west, south, east, north = bbox
     clip_rect = shape(
@@ -247,48 +283,58 @@ def clip_bbox_geom(geom, bbox):
             ],
         }
     )
-    return geom.intersection(clip_rect)
+    work = _prepare_geom_for_clip(geom) if not geom.is_valid else geom
+    if work.is_empty:
+        return work
+    return work.intersection(clip_rect)
 
 
 def public_land_features(geojson, bbox):
     out = []
+    skipped = 0
     for feature in geojson.get("features") or []:
-        props = dict(feature.get("properties") or {})
-        geom = shape(feature.get("geometry") or {})
-        if geom.is_empty:
-            continue
-        clipped = clip_bbox_geom(geom, bbox)
-        if clipped.is_empty:
-            continue
-        if clipped.geom_type == "Polygon":
-            polys = [clipped]
-        elif clipped.geom_type == "MultiPolygon":
-            polys = list(clipped.geoms)
-        else:
-            continue
-        for poly in polys:
-            if poly.is_empty:
+        try:
+            props = dict(feature.get("properties") or {})
+            geom = shape(feature.get("geometry") or {})
+            if geom.is_empty:
                 continue
-            fill_props = {**props, "role": "fill"}
-            out.append({"type": "Feature", "properties": fill_props, "geometry": mapping(poly)})
-            edge = clip_bbox_geom(LineString(poly.exterior.coords), bbox)
-            if edge.is_empty or edge.length == 0:
+            clipped = clip_bbox_geom(geom, bbox)
+            if clipped.is_empty:
                 continue
-            if edge.geom_type == "LineString":
-                lines = [edge]
-            elif edge.geom_type == "MultiLineString":
-                lines = list(edge.geoms)
+            if clipped.geom_type == "Polygon":
+                polys = [clipped]
+            elif clipped.geom_type == "MultiPolygon":
+                polys = list(clipped.geoms)
             else:
-                lines = []
-            for segment in lines:
-                edge_props = {**props, "role": "edge"}
-                out.append(
-                    {
-                        "type": "Feature",
-                        "properties": edge_props,
-                        "geometry": mapping(segment),
-                    }
-                )
+                continue
+            for poly in polys:
+                if poly.is_empty:
+                    continue
+                fill_props = {**props, "role": "fill"}
+                out.append({"type": "Feature", "properties": fill_props, "geometry": mapping(poly)})
+                edge = clip_bbox_geom(LineString(poly.exterior.coords), bbox)
+                if edge.is_empty or edge.length == 0:
+                    continue
+                if edge.geom_type == "LineString":
+                    lines = [edge]
+                elif edge.geom_type == "MultiLineString":
+                    lines = list(edge.geoms)
+                else:
+                    lines = []
+                for segment in lines:
+                    edge_props = {**props, "role": "edge"}
+                    out.append(
+                        {
+                            "type": "Feature",
+                            "properties": edge_props,
+                            "geometry": mapping(segment),
+                        }
+                    )
+        except Exception:
+            skipped += 1
+            continue
+    if skipped:
+        log(f"public_land_geom_skipped={skipped}")
     return out
 
 
