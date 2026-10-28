@@ -188,6 +188,142 @@ class PadusClipTests(unittest.TestCase):
         features = offline_packs.public_land_features({"type": "FeatureCollection", "features": []}, [0, 0, 1, 1])
         self.assertEqual(features, [])
 
+    def test_bowtie_and_invalid_ring_clip_to_polygon(self):
+        bbox = [0.0, 0.0, 1.0, 1.0]
+        bowtie = {
+            "type": "Feature",
+            "properties": {"OBJECTID": 1},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[0, 0], [2, 2], [2, 0], [0, 2], [0, 0]]],
+            },
+        }
+        invalid_ring = {
+            "type": "Feature",
+            "properties": {"OBJECTID": 2},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [
+                    [[0, 0], [4, 0], [4, 4], [0, 4], [0, 0]],
+                    [[1, 1], [3, 3], [3, 1], [1, 3], [1, 1]],
+                ],
+            },
+        }
+        for feature in (bowtie, invalid_ring):
+            clipped = offline_packs.clip_bbox_geom(
+                __import__("shapely").geometry.shape(feature["geometry"]),
+                bbox,
+            )
+            self.assertFalse(clipped.is_empty)
+            self.assertIn(clipped.geom_type, ("Polygon", "MultiPolygon"))
+
+    def test_valid_polygon_clip_unchanged(self):
+        from shapely.geometry import shape
+
+        bbox = [0.0, 0.0, 1.0, 1.0]
+        geom = shape(
+            {
+                "type": "Polygon",
+                "coordinates": [[[0.1, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9], [0.1, 0.1]]],
+            }
+        )
+        west, south, east, north = bbox
+        clip_rect = shape(
+            {
+                "type": "Polygon",
+                "coordinates": [
+                    [
+                        [west, south],
+                        [east, south],
+                        [east, north],
+                        [west, north],
+                        [west, south],
+                    ]
+                ],
+            }
+        )
+        expected = geom.intersection(clip_rect)
+        actual = offline_packs.clip_bbox_geom(geom, bbox)
+        self.assertTrue(expected.equals(actual))
+
+    def test_unrepairable_feature_skipped_chunk_still_builds(self):
+        x, y = 4479, 6638
+        bbox = offline_packs.tile_bbox_wgs84(offline_packs.CHUNK_Z, x, y)
+        west, south, east, north = bbox
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"OBJECTID": 99},
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [
+                            [
+                                [west, south],
+                                [east, north],
+                                [east, south],
+                                [west, north],
+                                [west, south],
+                            ]
+                        ],
+                    },
+                },
+                {
+                    "type": "Feature",
+                    "properties": {"OBJECTID": 100},
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [
+                            [
+                                [west + (east - west) * 0.2, south + (north - south) * 0.2],
+                                [west + (east - west) * 0.8, south + (north - south) * 0.2],
+                                [west + (east - west) * 0.8, south + (north - south) * 0.8],
+                                [west + (east - west) * 0.2, south + (north - south) * 0.8],
+                                [west + (east - west) * 0.2, south + (north - south) * 0.2],
+                            ]
+                        ],
+                    },
+                },
+            ],
+        }
+        real_clip = offline_packs.clip_bbox_geom
+
+        def flaky_clip(geom, clip_bbox):
+            if not geom.is_valid:
+                raise RuntimeError("TopologyException: simulated invalid clip")
+            return real_clip(geom, clip_bbox)
+
+        with mock.patch.object(offline_packs, "clip_bbox_geom", side_effect=flaky_clip):
+            with mock.patch.object(offline_packs, "log") as log_mock:
+                features = offline_packs.public_land_features(geojson, bbox)
+        messages = " ".join(str(call.args[0]) for call in log_mock.call_args_list)
+        self.assertIn("public_land_geom_skipped=1", messages)
+        self.assertTrue(any(feature["properties"]["OBJECTID"] == 100 for feature in features))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+
+            def fake_dem(path, _x, _y):
+                path.write_bytes(b"dem")
+
+            with mock.patch.object(offline_packs, "write_dem_pmtiles", side_effect=fake_dem), mock.patch.object(
+                offline_packs, "padus_query_geojson", return_value=geojson
+            ), mock.patch.object(offline_packs, "clip_bbox_geom", side_effect=flaky_clip):
+                manifest, _bytes, _dem_path, land_path, _manifest_path = offline_packs.build_chunk(
+                    x, y, work
+                )
+            self.assertTrue(land_path.is_file())
+            self.assertGreater(manifest["files"][1]["features"], 0)
+
+
+class WorkflowTimeoutTests(unittest.TestCase):
+    def test_offline_packs_and_terrain_wind_timeouts(self):
+        for name in ("offline-packs.yml", "terrain-wind.yml"):
+            text = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+            self.assertIn("timeout-minutes: 90", text)
+            self.assertIn('RUN_TIMEOUT_S: "5400"', text)
+
 
 class ManifestSchemaTests(unittest.TestCase):
     def test_manifest_bytes_and_hashes(self):
