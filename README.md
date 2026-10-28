@@ -8,7 +8,23 @@ Scheduled [WindNinja](https://github.com/firelab/windninja) 4.0.0 runs on GitHub
 - `workflow_dispatch` with `test=true` uses `fixtures/test-area.json` and does not call `AREAS_URL`
 - `repository_dispatch` type `areas-changed`
 
-One run at a time (`terrain-wind`). A failed area does not stop the others. Domains wider than 40 km are skipped.
+One run at a time (`terrain-wind`). A failed area does not stop the others. Domains wider than 40 km are skipped at 100 m resolution; optional `cell_m: 200` allows edges up to 80 km before skip.
+
+Failed scheduled or `repository_dispatch` runs are automatically retried once (`auto-retry` workflow reruns failed jobs when `run_attempt` is 1). Manual and test dispatches are not retried.
+
+## Run status (R2)
+
+Each production run writes public status objects under `status/<workflow>/` (`status-test/` for fixture runs or a non-`wind` output prefix):
+
+- `latest.json` — current run: `{v, workflow, run_id, run_attempt, event, started, finished, timeout_s, conclusion, …counts}`
+- `history.json` — last 40 runs (newest first), keyed by `run_id` + `run_attempt`
+
+`Cache-Control: no-cache`. Timed-out or killed runs may leave `finished: null`. Counts and tile keys only (no club ids, bboxes, tokens, or URLs).
+
+`terrain-wind` finish counts: `tiles_requested`, `tiles_ok`, `tiles_failed`, `tiles_capped`, `areas_oversized`, `areas_coarse`, `hrrr_cycle`.  
+`offline-packs` finish counts: `chunks_built`, `chunks_skipped`, `chunks_failed`, `uploaded_mb`.
+
+Workflow env `RUN_TIMEOUT_S` matches job `timeout-minutes` (3600 seconds).
 
 ## Secrets
 
@@ -21,8 +37,10 @@ S3 endpoint `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`, region `auto`. I
 `GET` with header `Authorization: Bearer <AREAS_TOKEN>`.
 
 ```json
-{"areas":[{"key":"<opaque string>","bbox":[minLon,minLat,maxLon,maxLat]}]}
+{"areas":[{"key":"<opaque string>","bbox":[minLon,minLat,maxLon,maxLat],"cell_m":100}]}
 ```
+
+Optional `cell_m` is `100` (default) or `200` for coarser grids on larger domains. Areas are split into 0.1° tiles; overlapping tiles use the smallest `cell_m`. A per-run cost budget (60 at 100 m, 0.5 per 200 m tile) caps work; dropped tile keys appear in status as `tiles_capped`.
 
 `bbox` is west, south, east, north in WGS84 degrees.
 

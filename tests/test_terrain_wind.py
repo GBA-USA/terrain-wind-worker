@@ -195,5 +195,87 @@ class TestFixtureTests(unittest.TestCase):
             self.assertEqual(keys, {"fixture-park-ridge", "test-reddish-knob"})
 
 
+class CellMValidationTests(unittest.TestCase):
+    def test_invalid_cell_m_defaults_to_100(self):
+        document = {
+            "areas": [
+                {"key": "a", "bbox": [-81.6, 32.2, -81.5, 32.3], "cell_m": 150},
+            ]
+        }
+        areas = terrain_wind.validate_areas(document)
+        self.assertEqual(areas[0]["cell_m"], 100)
+
+    def test_edge_limits_40_and_80_km(self):
+        # ~35 km square fits at 100 m
+        small = {"areas": [{"key": "ok", "bbox": [-81.0, 32.0, -80.68, 32.32], "cell_m": 100}]}
+        stats = {}
+        self.assertEqual(len(terrain_wind.validate_areas(small, stats)), 1)
+        self.assertEqual(stats["areas_oversized"], 0)
+
+        too_big_100 = {"areas": [{"key": "big", "bbox": [-82.0, 32.0, -81.5, 32.5], "cell_m": 100}]}
+        stats = {}
+        self.assertEqual(len(terrain_wind.validate_areas(too_big_100, stats)), 0)
+        self.assertEqual(stats["areas_oversized"], 1)
+
+        coarse_ok = {"areas": [{"key": "wide", "bbox": [-82.0, 32.0, -81.2, 32.5], "cell_m": 200}]}
+        stats = {}
+        self.assertEqual(len(terrain_wind.validate_areas(coarse_ok, stats)), 1)
+        self.assertEqual(stats["areas_coarse"], 1)
+
+    def test_overlap_smallest_cell_wins(self):
+        areas = [
+            {"key": "fine", "bbox": [-81.6, 32.2, -81.4, 32.4], "cell_m": 100},
+            {"key": "coarse", "bbox": [-81.55, 32.25, -81.45, 32.35], "cell_m": 200},
+        ]
+        expanded = terrain_wind.expand_areas_to_tiles(areas)
+        by_key = {item["key"]: item["cell_m"] for item in expanded}
+        for cell_m in by_key.values():
+            self.assertEqual(cell_m, 100)
+
+    def test_budget_prefers_100m_and_reports_capped(self):
+        areas = []
+        for lng_i in range(80):
+            areas.append(
+                {
+                    "key": f"a-{lng_i}",
+                    "bbox": terrain_wind.tile_bbox(322, lng_i),
+                    "cell_m": 100,
+                }
+            )
+        for lng_i in range(80, 120):
+            areas.append(
+                {
+                    "key": f"b-{lng_i}",
+                    "bbox": terrain_wind.tile_bbox(323, lng_i),
+                    "cell_m": 200,
+                }
+            )
+        capped = []
+        selected = terrain_wind.expand_areas_to_tiles(areas, capped_out=capped)
+        self.assertTrue(all(item["cell_m"] == 100 for item in selected))
+        self.assertGreater(len(capped), 0)
+        cost = sum(terrain_wind.tile_budget_cost(item["cell_m"]) for item in selected)
+        self.assertLessEqual(cost, terrain_wind.TILE_BUDGET + 1e-6)
+
+    def test_grid_shape_200m_halves_nx_ny(self):
+        bbox = [-81.5901, 32.2670, -81.5632, 32.2927]
+        nx100, ny100, _ = terrain_wind.grid_shape(bbox, cell_m=100)
+        nx200, ny200, _ = terrain_wind.grid_shape(bbox, cell_m=200)
+        self.assertAlmostEqual(nx200, nx100 / 2, delta=1)
+        self.assertAlmostEqual(ny200, ny100 / 2, delta=1)
+
+    def test_default_100m_cfg_unchanged(self):
+        options = {
+            "diurnal": True,
+            "stability": True,
+            "momentum": False,
+            "utc_hours": None,
+            "output_prefix": "wind",
+        }
+        pairs = dict(terrain_wind.build_base_cfg_pairs("/dem.tif", "/out", options, cell_m=100))
+        self.assertEqual(pairs["mesh_resolution"], "100")
+        self.assertEqual(pairs["ascii_out_resolution"], "100")
+
+
 if __name__ == "__main__":
     unittest.main()

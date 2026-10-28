@@ -43,8 +43,13 @@ SCENT_WEATHER_KEYS = (
 )
 MPS_TO_MPH = 2.2369362920544
 MAX_EDGE_KM = 40
+MAX_EDGE_KM_COARSE = 80
 TILE_EPS = 1e-9
 TILE_CAP = 60
+TILE_BUDGET = 60.0
+TILE_COST_100 = 1.0
+TILE_COST_200 = 0.5
+ALLOWED_CELL_M = frozenset({100, 200})
 DEM_BUFFER_M = 800
 CELL_M = 100
 UA = {"User-Agent": "terrain-wind-worker"}
@@ -199,10 +204,38 @@ def span_km(bbox):
     return width, height
 
 
-def validate_areas(document):
+def normalize_cell_m(raw):
+    if raw is None:
+        return CELL_M
+    if isinstance(raw, bool):
+        log("invalid cell_m, using 100")
+        return CELL_M
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        log("invalid cell_m, using 100")
+        return CELL_M
+    if value in ALLOWED_CELL_M:
+        return value
+    log("invalid cell_m, using 100")
+    return CELL_M
+
+
+def max_edge_km(cell_m):
+    return MAX_EDGE_KM_COARSE if cell_m == 200 else MAX_EDGE_KM
+
+
+def tile_budget_cost(cell_m):
+    return TILE_COST_200 if cell_m == 200 else TILE_COST_100
+
+
+def validate_areas(document, stats=None):
     if not isinstance(document, dict) or not isinstance(document.get("areas"), list):
         raise RuntimeError("areas response was not usable")
     areas = []
+    if stats is not None:
+        stats.setdefault("areas_oversized", 0)
+        stats.setdefault("areas_coarse", 0)
     for item in document["areas"]:
         if not isinstance(item, dict):
             log("skipped invalid area")
@@ -226,11 +259,19 @@ def validate_areas(document):
         if not (-180.0 <= min_lon < max_lon <= 180.0 and -90.0 <= min_lat < max_lat <= 90.0):
             log(f"area {key} skipped: bad bbox")
             continue
+        cell_m = normalize_cell_m(item.get("cell_m"))
+        if stats is not None and cell_m == 200:
+            stats["areas_coarse"] += 1
+        edge_limit = max_edge_km(cell_m)
         width_km, height_km = span_km((min_lon, min_lat, max_lon, max_lat))
-        if width_km > MAX_EDGE_KM or height_km > MAX_EDGE_KM:
-            log(f"area {key} skipped: domain exceeds {MAX_EDGE_KM} km")
+        if width_km > edge_limit or height_km > edge_limit:
+            if stats is not None:
+                stats["areas_oversized"] += 1
+            log(f"area {key} skipped: domain exceeds {edge_limit} km")
             continue
-        areas.append({"key": key, "bbox": [min_lon, min_lat, max_lon, max_lat]})
+        areas.append(
+            {"key": key, "bbox": [min_lon, min_lat, max_lon, max_lat], "cell_m": cell_m}
+        )
     return areas
 
 
@@ -267,16 +308,35 @@ def areas_from_tiles(tile_map):
     return [{"key": key, "bbox": tile_map[key]} for key in sorted(tile_map)]
 
 
-def expand_areas_to_tiles(areas):
-    tiles = {}
+def expand_areas_to_tiles(areas, capped_out=None):
+    tile_meta = {}
     for area in areas:
-        tiles.update(tiles_for_bbox(area["bbox"]))
-    expanded = areas_from_tiles(tiles)
-    if len(expanded) > TILE_CAP:
-        skipped = len(expanded) - TILE_CAP
-        log(f"tile cap reached, skipped {skipped}")
-        expanded = expanded[:TILE_CAP]
-    return expanded
+        cell_m = area.get("cell_m", CELL_M)
+        for key, bbox in tiles_for_bbox(area["bbox"]).items():
+            if key not in tile_meta:
+                tile_meta[key] = {"bbox": bbox, "cell_m": cell_m}
+            else:
+                tile_meta[key]["cell_m"] = min(tile_meta[key]["cell_m"], cell_m)
+    ordered = sorted(
+        tile_meta.items(),
+        key=lambda item: (0 if item[1]["cell_m"] == CELL_M else 1, item[0]),
+    )
+    selected = []
+    capped = []
+    budget_used = 0.0
+    for key, info in ordered:
+        cost = tile_budget_cost(info["cell_m"])
+        if budget_used + cost <= TILE_BUDGET + 1e-9:
+            selected.append({"key": key, "bbox": info["bbox"], "cell_m": info["cell_m"]})
+            budget_used += cost
+        else:
+            capped.append(key)
+    if capped:
+        log(f"tile cap reached, skipped {len(capped)}")
+    if capped_out is not None:
+        capped_out.clear()
+        capped_out.extend(capped)
+    return selected
 
 
 def resolve():
@@ -315,15 +375,25 @@ def resolve():
             log("areas response was not usable")
             sys.exit(1)
     try:
-        areas = validate_areas(document)
+        area_stats = {"areas_oversized": 0, "areas_coarse": 0}
+        areas = validate_areas(document, area_stats)
     except RuntimeError as exc:
         log(str(exc))
         sys.exit(1)
+    capped_keys = []
     if not test_mode:
-        areas = expand_areas_to_tiles(areas)
+        areas = expand_areas_to_tiles(areas, capped_out=capped_keys)
     areas = filter_areas_by_tiles(areas, tile_filter_from_env())
+    wind_meta = {
+        "areas_oversized": area_stats["areas_oversized"],
+        "areas_coarse": area_stats["areas_coarse"],
+        "tiles_capped": capped_keys,
+    }
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps({"areas": areas}), encoding="utf-8")
+    out_path.write_text(
+        json.dumps({"areas": areas, "wind_meta": wind_meta}),
+        encoding="utf-8",
+    )
     if not areas:
         emit("has_areas", "false")
         emit("cache_key", "none")
@@ -902,7 +972,9 @@ def cfg_bool(value):
     return "true" if value else "false"
 
 
-def build_base_cfg_pairs(dem, out_dir, options):
+def build_base_cfg_pairs(dem, out_dir, options, cell_m=CELL_M):
+    if cell_m not in ALLOWED_CELL_M:
+        cell_m = CELL_M
     diurnal = options["diurnal"]
     stability = options["stability"]
     momentum = options["momentum"]
@@ -914,7 +986,7 @@ def build_base_cfg_pairs(dem, out_dir, options):
         ("units_output_wind_height", "m"),
         ("output_speed_units", "mps"),
         ("vegetation", "grass"),
-        ("mesh_resolution", str(CELL_M)),
+        ("mesh_resolution", str(cell_m)),
         ("units_mesh_resolution", "m"),
         ("diurnal_winds", cfg_bool(diurnal)),
         ("non_neutral_stability", cfg_bool(stability and not momentum)),
@@ -924,7 +996,7 @@ def build_base_cfg_pairs(dem, out_dir, options):
         ("ascii_out_proj", "false"),
         ("ascii_out_geog", "true"),
         ("ascii_out_uv", "true"),
-        ("ascii_out_resolution", str(CELL_M)),
+        ("ascii_out_resolution", str(cell_m)),
         ("units_ascii_out_resolution", "m"),
         ("write_goog_output", "false"),
         ("write_shapefile_output", "false"),
@@ -944,10 +1016,10 @@ def build_base_cfg_pairs(dem, out_dir, options):
     return pairs
 
 
-def base_cfg(dem, out_dir, options=None):
+def base_cfg(dem, out_dir, options=None, cell_m=CELL_M):
     if options is None:
         options = windninja_run_options_from_env()
-    return build_base_cfg_pairs(dem, out_dir, options)
+    return build_base_cfg_pairs(dem, out_dir, options, cell_m=cell_m)
 
 
 def ensure_momentum_supported(env):
@@ -1059,12 +1131,14 @@ def output_grid(asc_path, bbox, nx, ny, work, name):
     return cleaned
 
 
-def grid_shape(bbox):
+def grid_shape(bbox, cell_m=CELL_M):
+    if cell_m not in ALLOWED_CELL_M:
+        cell_m = CELL_M
     width_km, height_km = span_km(bbox)
-    nx = max(2, int(round(width_km * 1000.0 / CELL_M)))
-    ny = max(2, int(round(height_km * 1000.0 / CELL_M)))
-    cell_m = round(((width_km * 1000.0 / nx) + (height_km * 1000.0 / ny)) / 2.0, 1)
-    return nx, ny, cell_m
+    nx = max(2, int(round(width_km * 1000.0 / cell_m)))
+    ny = max(2, int(round(height_km * 1000.0 / cell_m)))
+    resolved = round(((width_km * 1000.0 / nx) + (height_km * 1000.0 / ny)) / 2.0, 1)
+    return nx, ny, resolved
 
 
 def find_uv(out_dir):
@@ -1075,12 +1149,12 @@ def find_uv(out_dir):
     return u_files[0], v_files[0]
 
 
-def solve_hour(mode, grib, dem, bbox, valid, work, env, run_options):
+def solve_hour(mode, grib, dem, bbox, valid, work, env, run_options, cell_m=CELL_M):
     out_dir = work / "out"
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True)
-    pairs = base_cfg(dem, out_dir, run_options)
+    pairs = base_cfg(dem, out_dir, run_options, cell_m=cell_m)
     if mode == "wx":
         pairs[2:2] = [
             ("initialization_method", "wxModelInitialization"),
@@ -1277,13 +1351,14 @@ def publish_area(area, records, run_stamp, env, endpoint, bucket, output_prefix=
 def process_area(area, cycle, prefix, cache_dir, storage, run_options):
     key = area["key"]
     bbox = area["bbox"]
+    cell_m = area.get("cell_m", CELL_M)
     work_root = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "terrain-wind" / key
     if work_root.exists():
         shutil.rmtree(work_root)
     work_root.mkdir(parents=True)
     dem = dem_for(area, cache_dir)
     env = windninja_env(prefix)
-    nx, ny, cell_m = grid_shape(bbox)
+    nx, ny, resolved_cell_m = grid_shape(bbox, cell_m=cell_m)
     mode = "wx"
     records = []
     utc_hours = run_options["utc_hours"]
@@ -1299,12 +1374,16 @@ def process_area(area, cycle, prefix, cache_dir, storage, run_options):
             hrrr_bytes += subset_bytes
             weather = weather_from_grib(grib, bbox, hour_work)
             try:
-                u_asc, v_asc = solve_hour(mode, grib, dem, bbox, valid, hour_work, env, run_options)
+                u_asc, v_asc = solve_hour(
+                    mode, grib, dem, bbox, valid, hour_work, env, run_options, cell_m=cell_m
+                )
             except Exception:
                 if mode == "wx":
                     log(f"area {key} HRRR subset not accepted; using gridded initialization")
                     mode = "gridded"
-                    u_asc, v_asc = solve_hour(mode, grib, dem, bbox, valid, hour_work, env, run_options)
+                    u_asc, v_asc = solve_hour(
+                        mode, grib, dem, bbox, valid, hour_work, env, run_options, cell_m=cell_m
+                    )
                 else:
                     raise
             u_values = output_grid(u_asc, bbox, nx, ny, hour_work, "u")
@@ -1319,7 +1398,7 @@ def process_area(area, cycle, prefix, cache_dir, storage, run_options):
                         bbox,
                         nx,
                         ny,
-                        cell_m,
+                        resolved_cell_m,
                         u_values,
                         v_values,
                         weather=weather,
@@ -1347,49 +1426,89 @@ def process_area(area, cycle, prefix, cache_dir, storage, run_options):
 
 
 def execute():
+    script_dir = Path(__file__).resolve().parent
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    from run_status import RunStatusReporter
+
+    status = RunStatusReporter("terrain-wind")
+    status.start()
     started = datetime.now(timezone.utc)
-    areas_path = Path(os.environ.get("AREAS_FILE", "areas.json"))
-    if not areas_path.is_file():
-        log("no areas source")
-        return
-    areas = validate_areas(json.loads(areas_path.read_text(encoding="utf-8")))
-    areas = filter_areas_by_tiles(areas, tile_filter_from_env())
-    if not areas:
-        log("no areas source")
-        return
-    storage = r2_env()
-    run_options = windninja_run_options_from_env()
-    prefix = Path(os.environ.get("WINDNINJA_PREFIX", str(Path.home() / "windninja")))
-    wn_env = windninja_env(prefix)
-    if run_options["momentum"]:
-        ensure_momentum_supported(wn_env)
-    cache_dir = Path(os.environ.get("DEM_CACHE", "dem-cache"))
-    cycle = latest_hrrr_cycle()
-    log(f"hrrr_cycle={iso(cycle)}")
-    if run_options["output_prefix"] != "wind":
-        log(f"output_prefix={run_options['output_prefix']}")
-    failed = 0
+    conclusion = "success"
+    exit_code = 0
+    status_fields = {
+        "tiles_requested": 0,
+        "tiles_ok": [],
+        "tiles_failed": [],
+        "tiles_capped": [],
+        "areas_oversized": 0,
+        "areas_coarse": 0,
+        "hrrr_cycle": None,
+    }
     uploaded = 0
-    for area in areas:
-        try:
-            uploaded += process_area(area, cycle, prefix, cache_dir, storage, run_options)
-        except Exception as exc:
-            failed += 1
-            log(f"area {area['key']} failed: {scrub(exc, area['bbox'])}")
-    elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-    log(
-        f"runtime_s={elapsed:.0f} uploaded_bytes={uploaded} "
-        f"uploaded_mb={uploaded / 1_000_000:.3f} areas_failed={failed}"
-    )
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary:
-        with open(summary, "a", encoding="utf-8") as handle:
-            handle.write(
-                f"runtime_s={elapsed:.0f} uploaded_mb={uploaded / 1_000_000:.3f} "
-                f"areas_failed={failed}\n"
-            )
-    if failed:
-        sys.exit(1)
+    failed = 0
+    try:
+        areas_path = Path(os.environ.get("AREAS_FILE", "areas.json"))
+        if not areas_path.is_file():
+            log("no areas source")
+            return
+        document = json.loads(areas_path.read_text(encoding="utf-8"))
+        wind_meta = document.get("wind_meta") if isinstance(document, dict) else None
+        if not isinstance(wind_meta, dict):
+            wind_meta = {}
+        status_fields["areas_oversized"] = int(wind_meta.get("areas_oversized") or 0)
+        status_fields["areas_coarse"] = int(wind_meta.get("areas_coarse") or 0)
+        capped = wind_meta.get("tiles_capped")
+        status_fields["tiles_capped"] = list(capped) if isinstance(capped, list) else []
+        areas = validate_areas(document)
+        areas = filter_areas_by_tiles(areas, tile_filter_from_env())
+        status_fields["tiles_requested"] = len(areas)
+        if not areas:
+            log("no areas source")
+            return
+        storage = r2_env()
+        run_options = windninja_run_options_from_env()
+        prefix = Path(os.environ.get("WINDNINJA_PREFIX", str(Path.home() / "windninja")))
+        wn_env = windninja_env(prefix)
+        if run_options["momentum"]:
+            ensure_momentum_supported(wn_env)
+        cache_dir = Path(os.environ.get("DEM_CACHE", "dem-cache"))
+        cycle = latest_hrrr_cycle()
+        status_fields["hrrr_cycle"] = iso(cycle)
+        log(f"hrrr_cycle={iso(cycle)}")
+        if run_options["output_prefix"] != "wind":
+            log(f"output_prefix={run_options['output_prefix']}")
+        tiles_ok = []
+        tiles_failed = []
+        for area in areas:
+            try:
+                uploaded += process_area(area, cycle, prefix, cache_dir, storage, run_options)
+                tiles_ok.append(area["key"])
+            except Exception as exc:
+                failed += 1
+                tiles_failed.append(area["key"])
+                log(f"area {area['key']} failed: {scrub(exc, area['bbox'])}")
+        status_fields["tiles_ok"] = tiles_ok
+        status_fields["tiles_failed"] = tiles_failed
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        log(
+            f"runtime_s={elapsed:.0f} uploaded_bytes={uploaded} "
+            f"uploaded_mb={uploaded / 1_000_000:.3f} areas_failed={failed}"
+        )
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            with open(summary, "a", encoding="utf-8") as handle:
+                handle.write(
+                    f"runtime_s={elapsed:.0f} uploaded_mb={uploaded / 1_000_000:.3f} "
+                    f"areas_failed={failed}\n"
+                )
+        if failed:
+            exit_code = 1
+            conclusion = "partial" if tiles_ok else "failure"
+    finally:
+        status.finish(conclusion, **status_fields)
+    if exit_code:
+        sys.exit(exit_code)
 
 
 def main():
