@@ -514,6 +514,21 @@ def latest_hrrr_cycle():
     raise RuntimeError("no HRRR cycle available")
 
 
+def hrrr_cycle_from_env():
+    raw = os.environ.get("TERRAIN_WIND_HRRR_CYCLE", "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise RuntimeError("TERRAIN_WIND_HRRR_CYCLE is not YYYY-MM-DDTHH:MM:SSZ") from None
+
+
+def resolve_hrrr_cycle():
+    cycle = hrrr_cycle_from_env()
+    return cycle if cycle is not None else latest_hrrr_cycle()
+
+
 def hrrr_object(cycle, forecast_hour):
     ymd = cycle.strftime("%Y%m%d")
     hour = cycle.strftime("%H")
@@ -613,6 +628,25 @@ def fetch_hrrr_subset(cycle, forecast_hour, dest):
         raise RuntimeError("HRRR download failed") from None
     dest.write_bytes(blob)
     return cycle + timedelta(hours=forecast_hour), len(blob)
+
+
+def fetch_hrrr_subset_cached(cycle, forecast_hour, dest, cache_dir=None):
+    """Same bytes as fetch_hrrr_subset; tiles in one job share one download per hour."""
+    if cache_dir is None:
+        return fetch_hrrr_subset(cycle, forecast_hour, dest)
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cached = cache_dir / f"{cycle.strftime('%Y%m%d%H')}-f{forecast_hour:02d}.grib2"
+    valid = cycle + timedelta(hours=forecast_hour)
+    if not cached.is_file():
+        partial = cache_dir / f"{cached.name}.{os.getpid()}.part"
+        try:
+            fetch_hrrr_subset(cycle, forecast_hour, partial)
+            os.replace(partial, cached)
+        finally:
+            partial.unlink(missing_ok=True)
+    shutil.copyfile(cached, dest)
+    return valid, cached.stat().st_size
 
 
 def read_asc(path):
@@ -1348,6 +1382,11 @@ def publish_area(area, records, run_stamp, env, endpoint, bucket, output_prefix=
     return total
 
 
+def hrrr_cache_dir_from_env():
+    raw = os.environ.get("HRRR_CACHE_DIR", "").strip()
+    return Path(raw) if raw else None
+
+
 def process_area(area, cycle, prefix, cache_dir, storage, run_options):
     key = area["key"]
     bbox = area["bbox"]
@@ -1368,7 +1407,9 @@ def process_area(area, cycle, prefix, cache_dir, storage, run_options):
         hour_work.mkdir()
         try:
             grib = hour_work / "hrrr.grib2"
-            valid, subset_bytes = fetch_hrrr_subset(cycle, forecast_hour, grib)
+            valid, subset_bytes = fetch_hrrr_subset_cached(
+                cycle, forecast_hour, grib, hrrr_cache_dir_from_env()
+            )
             if utc_hours is not None and valid.hour not in utc_hours:
                 continue
             hrrr_bytes += subset_bytes
@@ -1473,7 +1514,7 @@ def execute():
         if run_options["momentum"]:
             ensure_momentum_supported(wn_env)
         cache_dir = Path(os.environ.get("DEM_CACHE", "dem-cache"))
-        cycle = latest_hrrr_cycle()
+        cycle = resolve_hrrr_cycle()
         status_fields["hrrr_cycle"] = iso(cycle)
         log(f"hrrr_cycle={iso(cycle)}")
         if run_options["output_prefix"] != "wind":
@@ -1491,6 +1532,7 @@ def execute():
         status_fields["tiles_ok"] = tiles_ok
         status_fields["tiles_failed"] = tiles_failed
         elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        write_result_file(tiles_ok, tiles_failed, uploaded, elapsed)
         log(
             f"runtime_s={elapsed:.0f} uploaded_bytes={uploaded} "
             f"uploaded_mb={uploaded / 1_000_000:.3f} areas_failed={failed}"
@@ -1511,12 +1553,183 @@ def execute():
         sys.exit(exit_code)
 
 
+BATCH_SIZE = 2
+
+
+def batch_areas(areas, size=BATCH_SIZE):
+    ordered = sorted(areas, key=lambda area: area["key"])
+    return [ordered[start : start + size] for start in range(0, len(ordered), size)]
+
+
+def batch_cache_key(areas):
+    stamp = json.dumps(
+        sorted([area["key"], area["bbox"], area.get("cell_m", CELL_M)] for area in areas),
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(stamp.encode()).hexdigest()[:16]
+
+
+def write_result_file(tiles_ok, tiles_failed, uploaded_bytes, runtime_s):
+    raw = os.environ.get("RUN_RESULT_FILE", "").strip()
+    if not raw:
+        return
+    path = Path(raw)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "tiles_ok": tiles_ok,
+                "tiles_failed": tiles_failed,
+                "uploaded_bytes": uploaded_bytes,
+                "runtime_s": round(runtime_s, 1),
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+
+def import_run_status():
+    script_dir = Path(__file__).resolve().parent
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    import run_status
+
+    return run_status
+
+
+def plan():
+    """Split resolved areas into batches, write the start status, pin the HRRR cycle."""
+    document = json.loads(Path(os.environ.get("AREAS_FILE", "areas.json")).read_text(encoding="utf-8"))
+    areas = validate_areas(document)
+    wind_meta = document.get("wind_meta") if isinstance(document, dict) else None
+    if not isinstance(wind_meta, dict):
+        wind_meta = {}
+    capped = wind_meta.get("tiles_capped")
+    meta = {
+        "areas_oversized": int(wind_meta.get("areas_oversized") or 0),
+        "areas_coarse": int(wind_meta.get("areas_coarse") or 0),
+        "tiles_capped": list(capped) if isinstance(capped, list) else [],
+    }
+    batches = [
+        {"batch": index, "keys": [area["key"] for area in group]}
+        for index, group in enumerate(batch_areas(areas))
+    ]
+    emit("batches", json.dumps(batches, separators=(",", ":")))
+    emit("batch_indexes", json.dumps([item["batch"] for item in batches], separators=(",", ":")))
+    emit("meta", json.dumps(meta, separators=(",", ":")))
+    log(f"tiles={len(areas)} batches={len(batches)}")
+    if not batches:
+        return
+    status = import_run_status().RunStatusReporter("terrain-wind")
+    emit("started", status.started_wall)
+    status.start()
+    cycle = resolve_hrrr_cycle()
+    emit("hrrr_cycle", iso(cycle))
+    log(f"hrrr_cycle={iso(cycle)}")
+
+
+def batch():
+    """Write this job's batch (BATCH_INDEX) to BATCH_FILE and emit its DEM cache key."""
+    document = json.loads(Path(os.environ.get("AREAS_FILE", "areas.json")).read_text(encoding="utf-8"))
+    groups = batch_areas(validate_areas(document))
+    index = int(os.environ["BATCH_INDEX"])
+    if index < 0 or index >= len(groups):
+        log("batch index out of range")
+        sys.exit(1)
+    out_path = Path(os.environ.get("BATCH_FILE", "batch.json"))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps({"areas": groups[index]}), encoding="utf-8")
+    emit("cache_key", batch_cache_key(groups[index]))
+    log(f"batch={index} tiles={len(groups[index])}")
+
+
+def merge_batch_results(planned_keys, results, plan_ok=True):
+    """Fold per-batch result files into the run-level status fields.
+
+    A planned tile with no ok report (crashed or missing batch) counts as failed.
+    """
+    planned = list(planned_keys)
+    wanted = set(planned)
+    ok_seen = set()
+    uploaded = 0
+    runtime = 0.0
+    for result in results if plan_ok else []:
+        ok_seen.update(key for key in result.get("tiles_ok", []) if key in wanted)
+        uploaded += int(result.get("uploaded_bytes") or 0)
+        runtime = max(runtime, float(result.get("runtime_s") or 0))
+    tiles_ok = [key for key in planned if key in ok_seen]
+    tiles_failed = [key for key in planned if key not in ok_seen]
+    if tiles_failed:
+        conclusion = "partial" if tiles_ok else "failure"
+    else:
+        conclusion = "success"
+    return {
+        "conclusion": conclusion,
+        "tiles_ok": tiles_ok,
+        "tiles_failed": tiles_failed,
+        "uploaded_bytes": uploaded,
+        "max_batch_runtime_s": runtime,
+    }
+
+
+def finalize():
+    """Merge batch results and write the finish status once."""
+    run_status = import_run_status()
+    try:
+        batches = json.loads(os.environ.get("PLAN_BATCHES") or "[]")
+        meta = json.loads(os.environ.get("PLAN_META") or "{}")
+    except json.JSONDecodeError:
+        batches, meta = [], {}
+    planned = [key for item in batches for key in item.get("keys", [])]
+    results = []
+    results_dir = Path(os.environ.get("RESULTS_DIR", "results"))
+    if results_dir.is_dir():
+        for path in sorted(results_dir.glob("*.json")):
+            try:
+                results.append(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError):
+                log(f"ignoring unreadable result {path.name}")
+    plan_ok = os.environ.get("PLAN_RESULT", "success") == "success"
+    merged = merge_batch_results(planned, results, plan_ok=plan_ok)
+    status = run_status.RunStatusReporter("terrain-wind")
+    capped = meta.get("tiles_capped")
+    status.finish(
+        merged["conclusion"],
+        tiles_requested=len(planned),
+        tiles_ok=merged["tiles_ok"],
+        tiles_failed=merged["tiles_failed"],
+        tiles_capped=list(capped) if isinstance(capped, list) else [],
+        areas_oversized=int(meta.get("areas_oversized") or 0),
+        areas_coarse=int(meta.get("areas_coarse") or 0),
+        hrrr_cycle=os.environ.get("HRRR_CYCLE", "").strip() or None,
+    )
+    line = (
+        f"conclusion={merged['conclusion']} tiles_ok={len(merged['tiles_ok'])} "
+        f"tiles_failed={len(merged['tiles_failed'])} uploaded_bytes={merged['uploaded_bytes']} "
+        f"batches_reported={len(results)}"
+    )
+    log(line)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    if merged["tiles_failed"]:
+        sys.exit(1)
+
+
 def main():
     command = sys.argv[1] if len(sys.argv) > 1 else "run"
     if command == "resolve":
         resolve()
     elif command == "run":
         execute()
+    elif command == "plan":
+        plan()
+    elif command == "batch":
+        batch()
+    elif command == "finalize":
+        finalize()
     else:
         log("unknown command")
         sys.exit(2)

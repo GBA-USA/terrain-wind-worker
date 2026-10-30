@@ -318,11 +318,10 @@ class PadusClipTests(unittest.TestCase):
 
 
 class WorkflowTimeoutTests(unittest.TestCase):
-    def test_offline_packs_and_terrain_wind_timeouts(self):
-        for name in ("offline-packs.yml", "terrain-wind.yml"):
-            text = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
-            self.assertIn("timeout-minutes: 90", text)
-            self.assertIn('RUN_TIMEOUT_S: "5400"', text)
+    def test_offline_packs_timeouts(self):
+        text = (ROOT / ".github" / "workflows" / "offline-packs.yml").read_text(encoding="utf-8")
+        self.assertIn("timeout-minutes: 90", text)
+        self.assertIn('RUN_TIMEOUT_S: "5400"', text)
 
 
 class ManifestSchemaTests(unittest.TestCase):

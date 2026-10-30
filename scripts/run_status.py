@@ -42,6 +42,10 @@ def status_root_dir(workflow):
     return "status"
 
 
+def status_skipped():
+    return os.environ.get("RUN_STATUS_SKIP", "").strip().lower() == "true"
+
+
 def github_field(name, default):
     raw = os.environ.get(name, "").strip()
     return raw if raw else default
@@ -217,8 +221,21 @@ class RunStatusReporter:
         self.store = store or store_for_env()
         self.started_wall = iso_now()
         self.started_monotonic = time.monotonic()
+        self._adopt_started(os.environ.get("RUN_STATUS_STARTED", "").strip())
         self.run_id, self.run_attempt, self.event = run_identity()
         self._base = None
+
+    def _adopt_started(self, raw):
+        """Continue a run begun by an earlier job (plan) so runtime_s spans the whole run."""
+        if not raw:
+            return
+        try:
+            begun = datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return
+        elapsed = max(0.0, (datetime.now(timezone.utc) - begun).total_seconds())
+        self.started_wall = raw
+        self.started_monotonic = time.monotonic() - elapsed
 
     def _base_payload(self):
         if self._base is None:
@@ -252,6 +269,8 @@ class RunStatusReporter:
             log(f"run status write failed: {type(exc).__name__}")
 
     def start(self):
+        if status_skipped():
+            return
         payload = self._base_payload()
 
         def do_write():
@@ -261,6 +280,8 @@ class RunStatusReporter:
         self._safe_write(do_write)
 
     def finish(self, conclusion, **fields):
+        if status_skipped():
+            return
         runtime_s = time.monotonic() - self.started_monotonic
         payload = self._base_payload()
         payload.update(fields)
