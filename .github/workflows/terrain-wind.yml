@@ -70,24 +70,28 @@ jobs:
       meta: ${{ steps.plan.outputs.meta }}
       started: ${{ steps.plan.outputs.started }}
       hrrr_cycle: ${{ steps.plan.outputs.hrrr_cycle }}
-    env:
-      AREAS_FILE: ${{ runner.temp }}/areas.json
     steps:
       - uses: actions/checkout@v4
 
       - name: Resolve areas
         id: areas
+        env:
+          AREAS_FILE: ${{ runner.temp }}/areas.json
         run: python3 scripts/terrain_wind.py resolve
 
       - name: Plan batches and pin HRRR cycle
         id: plan
         if: steps.areas.outputs.has_areas == 'true'
+        env:
+          AREAS_FILE: ${{ runner.temp }}/areas.json
         run: python3 scripts/terrain_wind.py plan
 
       # Public repo: artifacts are world-readable, so areas never leave the
       # runner unencrypted. AREAS_TOKEN is the passphrase (empty only for fixtures).
       - name: Seal areas for batch jobs
         if: steps.areas.outputs.has_areas == 'true'
+        env:
+          AREAS_FILE: ${{ runner.temp }}/areas.json
         run: |
           if [ -n "$AREAS_TOKEN" ]; then
             openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
@@ -118,13 +122,9 @@ jobs:
         batch: ${{ fromJSON(needs.plan.outputs.batch_indexes) }}
     env:
       DEM_CACHE: ${{ github.workspace }}/dem-cache
-      AREAS_FILE: ${{ runner.temp }}/areas.json
-      BATCH_FILE: ${{ runner.temp }}/batch.json
       BATCH_INDEX: ${{ matrix.batch }}
       TERRAIN_WIND_HRRR_CYCLE: ${{ needs.plan.outputs.hrrr_cycle }}
-      HRRR_CACHE_DIR: ${{ runner.temp }}/hrrr-cache
       RUN_STATUS_SKIP: "true"
-      RUN_RESULT_FILE: ${{ runner.temp }}/result/result-${{ matrix.batch }}.json
     steps:
       - uses: actions/checkout@v4
 
@@ -136,6 +136,9 @@ jobs:
 
       - name: Select batch
         id: batch
+        env:
+          AREAS_FILE: ${{ runner.temp }}/areas.json
+          BATCH_FILE: ${{ runner.temp }}/batch.json
         run: |
           if [ -n "$AREAS_TOKEN" ]; then
             openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
@@ -143,7 +146,7 @@ jobs:
           else
             cp "$RUNNER_TEMP/areas-dl/areas.bin" "$AREAS_FILE"
           fi
-          AREAS_FILE="$AREAS_FILE" python3 scripts/terrain_wind.py batch
+          python3 scripts/terrain_wind.py batch
 
       - name: Cache WindNinja
         uses: actions/cache@v4
@@ -163,6 +166,8 @@ jobs:
         env:
           WINDNINJA_PREFIX: ${{ runner.tool_cache }}/windninja
           AREAS_FILE: ${{ runner.temp }}/batch.json
+          HRRR_CACHE_DIR: ${{ runner.temp }}/hrrr-cache
+          RUN_RESULT_FILE: ${{ runner.temp }}/result/result-${{ matrix.batch }}.json
         run: |
           bash scripts/build_windninja.sh
           python3 scripts/terrain_wind.py run
@@ -189,7 +194,6 @@ jobs:
       PLAN_META: ${{ needs.plan.outputs.meta }}
       HRRR_CYCLE: ${{ needs.plan.outputs.hrrr_cycle }}
       RUN_STATUS_STARTED: ${{ needs.plan.outputs.started }}
-      RESULTS_DIR: ${{ runner.temp }}/results
     steps:
       - uses: actions/checkout@v4
 
@@ -204,4 +208,6 @@ jobs:
       # Writes status/terrain-wind latest + history once; exits 1 if any tile failed
       # so the failed-jobs rerun (auto-retry) picks up the failed batches and this job.
       - name: Merge results and publish status
+        env:
+          RESULTS_DIR: ${{ runner.temp }}/results
         run: python3 scripts/terrain_wind.py finalize
