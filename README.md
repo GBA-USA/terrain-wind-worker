@@ -4,17 +4,23 @@ Scheduled [WindNinja](https://github.com/firelab/windninja) 4.0.0 runs on GitHub
 
 ## When it runs
 
-- Every 3 hours
+- Every 3 hours, at minute 17 (`17 */3 * * *`; off the top of the hour, where GitHub delays and drops scheduled runs)
 - `workflow_dispatch` with `test=true` uses `fixtures/test-area.json` and does not call `AREAS_URL`
 - `repository_dispatch` type `areas-changed`
 
-One run at a time (`terrain-wind`). A failed area does not stop the others. Domains wider than 40 km are skipped at 100 m resolution; optional `cell_m: 200` allows edges up to 80 km before skip.
+One run at a time (`terrain-wind`; a new run queues behind a running one). Each run is three jobs:
 
-Failed scheduled or `repository_dispatch` runs are automatically retried once (`auto-retry` workflow reruns failed jobs when `run_attempt` is 1). Manual and test dispatches are not retried.
+1. `plan` resolves areas, writes the start status once, and pins one HRRR cycle for the whole run. It splits the tiles (sorted by key) into batches of 2 and uploads the areas as an artifact, encrypted with `AREAS_TOKEN` because artifacts on a public repo are readable by anyone.
+2. `wind` is a matrix with one job per batch (`max-parallel: 10`, `fail-fast: false`, 30 min timeout). Each job runs its tiles with the pinned cycle (`TERRAIN_WIND_HRRR_CYCLE`), downloads each HRRR forecast hour once and reuses it for both tiles, skips status writes (`RUN_STATUS_SKIP=true`), and uploads a small result artifact (`tiles_ok`, `tiles_failed`, `uploaded_bytes`, `runtime_s`). Each batch has its own DEM cache.
+3. `finalize` merges the result artifacts and writes the finish status and history once. It fails if any tile failed, or if a batch produced no result.
+
+A full run is about 8 batches in parallel for 15 tiles, so wall time is roughly one batch (~10 min) instead of the sum of all tiles. Output keys and payloads are unchanged. A failed area does not stop the others. Domains wider than 40 km are skipped at 100 m resolution; optional `cell_m: 200` allows edges up to 80 km before skip.
+
+Failed scheduled or `repository_dispatch` runs are automatically retried once (`auto-retry` workflow reruns failed jobs when `run_attempt` is 1). That reruns only the failed batch jobs plus `finalize`, reusing the plan's HRRR cycle and the other batches' results. Manual and test dispatches are not retried.
 
 ## Run status (R2)
 
-Each production run writes public status objects under `status/<workflow>/` (`status-test/` for fixture runs or a non-`wind` output prefix):
+Each production run writes public status objects (`plan` writes the start, `finalize` writes the finish and history; batch jobs write none) under `status/<workflow>/` (`status-test/` for fixture runs or a non-`wind` output prefix):
 
 - `latest.json` — current run: `{v, workflow, run_id, run_attempt, event, started, finished, timeout_s, conclusion, …counts}`
 - `history.json` — last 40 runs (newest first), keyed by `run_id` + `run_attempt`
@@ -24,7 +30,7 @@ Each production run writes public status objects under `status/<workflow>/` (`st
 `terrain-wind` finish counts: `tiles_requested`, `tiles_ok`, `tiles_failed`, `tiles_capped`, `areas_oversized`, `areas_coarse`, `hrrr_cycle`.  
 `offline-packs` finish counts: `chunks_built`, `chunks_skipped`, `chunks_failed`, `uploaded_mb`.
 
-Workflow env `RUN_TIMEOUT_S` matches job `timeout-minutes` (3600 seconds).
+Workflow env `RUN_TIMEOUT_S` is 1800 seconds, matching the 30 minute per-batch `wind` job timeout. A batch that times out or crashes writes no result, so its tiles are reported in `tiles_failed`. `runtime_s` covers the whole run, from the plan job's start to finalize.
 
 ## Secrets
 

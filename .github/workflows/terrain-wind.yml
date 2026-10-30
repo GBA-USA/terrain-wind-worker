@@ -2,7 +2,7 @@ name: terrain-wind
 
 on:
   schedule:
-    - cron: "0 */3 * * *"
+    - cron: "17 */3 * * *"
   workflow_dispatch:
     inputs:
       test:
@@ -43,56 +43,165 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+  R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  R2_BUCKET: ${{ secrets.R2_BUCKET }}
+  AREAS_URL: ${{ secrets.AREAS_URL }}
+  AREAS_TOKEN: ${{ secrets.AREAS_TOKEN }}
+  TEST_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.test == 'true' }}
+  TERRAIN_WIND_DIURNAL: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.diurnal == 'true' && 'true' || 'false') || 'true' }}
+  TERRAIN_WIND_STABILITY: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.stability == 'true' && 'true' || 'false') || 'true' }}
+  TERRAIN_WIND_MOMENTUM: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.momentum == 'true' && 'true' || 'false') || 'false' }}
+  TERRAIN_WIND_TILES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tiles || '' }}
+  TERRAIN_WIND_HOURS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.hours || '' }}
+  TERRAIN_WIND_PREFIX: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prefix || 'wind' }}
+  RUN_TIMEOUT_S: "1800"
+
 jobs:
-  terrain-wind:
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 10
+    outputs:
+      has_areas: ${{ steps.areas.outputs.has_areas }}
+      batches: ${{ steps.plan.outputs.batches }}
+      batch_indexes: ${{ steps.plan.outputs.batch_indexes }}
+      meta: ${{ steps.plan.outputs.meta }}
+      started: ${{ steps.plan.outputs.started }}
+      hrrr_cycle: ${{ steps.plan.outputs.hrrr_cycle }}
     env:
-      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      R2_BUCKET: ${{ secrets.R2_BUCKET }}
-      AREAS_URL: ${{ secrets.AREAS_URL }}
-      AREAS_TOKEN: ${{ secrets.AREAS_TOKEN }}
-      TEST_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.test == 'true' }}
-      TERRAIN_WIND_DIURNAL: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.diurnal == 'true' && 'true' || 'false') || 'true' }}
-      TERRAIN_WIND_STABILITY: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.stability == 'true' && 'true' || 'false') || 'true' }}
-      TERRAIN_WIND_MOMENTUM: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.momentum == 'true' && 'true' || 'false') || 'false' }}
-      TERRAIN_WIND_TILES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tiles || '' }}
-      TERRAIN_WIND_HOURS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.hours || '' }}
-      TERRAIN_WIND_PREFIX: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prefix || 'wind' }}
-      DEM_CACHE: ${{ github.workspace }}/dem-cache
-      RUN_TIMEOUT_S: "5400"
+      AREAS_FILE: ${{ runner.temp }}/areas.json
     steps:
       - uses: actions/checkout@v4
 
       - name: Resolve areas
         id: areas
-        env:
-          AREAS_FILE: ${{ runner.temp }}/areas.json
         run: python3 scripts/terrain_wind.py resolve
 
-      - name: Cache WindNinja
+      - name: Plan batches and pin HRRR cycle
+        id: plan
         if: steps.areas.outputs.has_areas == 'true'
+        run: python3 scripts/terrain_wind.py plan
+
+      # Public repo: artifacts are world-readable, so areas never leave the
+      # runner unencrypted. AREAS_TOKEN is the passphrase (empty only for fixtures).
+      - name: Seal areas for batch jobs
+        if: steps.areas.outputs.has_areas == 'true'
+        run: |
+          if [ -n "$AREAS_TOKEN" ]; then
+            openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+              -in "$AREAS_FILE" -out "$RUNNER_TEMP/areas.bin" -pass env:AREAS_TOKEN
+          else
+            cp "$AREAS_FILE" "$RUNNER_TEMP/areas.bin"
+          fi
+
+      - name: Upload areas
+        if: steps.areas.outputs.has_areas == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: areas
+          path: ${{ runner.temp }}/areas.bin
+          retention-days: 1
+          overwrite: true
+
+  wind:
+    needs: plan
+    if: needs.plan.outputs.has_areas == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    name: wind (batch ${{ matrix.batch }})
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        batch: ${{ fromJSON(needs.plan.outputs.batch_indexes) }}
+    env:
+      DEM_CACHE: ${{ github.workspace }}/dem-cache
+      AREAS_FILE: ${{ runner.temp }}/areas.json
+      BATCH_FILE: ${{ runner.temp }}/batch.json
+      BATCH_INDEX: ${{ matrix.batch }}
+      TERRAIN_WIND_HRRR_CYCLE: ${{ needs.plan.outputs.hrrr_cycle }}
+      HRRR_CACHE_DIR: ${{ runner.temp }}/hrrr-cache
+      RUN_STATUS_SKIP: "true"
+      RUN_RESULT_FILE: ${{ runner.temp }}/result/result-${{ matrix.batch }}.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download areas
+        uses: actions/download-artifact@v4
+        with:
+          name: areas
+          path: ${{ runner.temp }}/areas-dl
+
+      - name: Select batch
+        id: batch
+        run: |
+          if [ -n "$AREAS_TOKEN" ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+              -in "$RUNNER_TEMP/areas-dl/areas.bin" -out "$AREAS_FILE" -pass env:AREAS_TOKEN
+          else
+            cp "$RUNNER_TEMP/areas-dl/areas.bin" "$AREAS_FILE"
+          fi
+          AREAS_FILE="$AREAS_FILE" python3 scripts/terrain_wind.py batch
+
+      - name: Cache WindNinja
         uses: actions/cache@v4
         with:
           path: ${{ runner.tool_cache }}/windninja
           key: windninja-4.0.0-cli-mass-${{ runner.os }}-v1
 
       - name: Cache DEMs
-        if: steps.areas.outputs.has_areas == 'true'
         uses: actions/cache@v4
         with:
           path: dem-cache
-          key: dem-${{ steps.areas.outputs.cache_key }}
+          key: dem-${{ steps.batch.outputs.cache_key }}
           restore-keys: |
             dem-
 
       - name: Run WindNinja and upload
-        if: steps.areas.outputs.has_areas == 'true'
         env:
           WINDNINJA_PREFIX: ${{ runner.tool_cache }}/windninja
-          AREAS_FILE: ${{ runner.temp }}/areas.json
+          AREAS_FILE: ${{ runner.temp }}/batch.json
         run: |
           bash scripts/build_windninja.sh
           python3 scripts/terrain_wind.py run
+
+      # Runs after a failed tile too, so finalize can see which tiles failed.
+      - name: Upload batch result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.batch }}
+          path: ${{ runner.temp }}/result/result-${{ matrix.batch }}.json
+          if-no-files-found: ignore
+          retention-days: 1
+          overwrite: true
+
+  finalize:
+    needs: [plan, wind]
+    if: always() && needs.plan.outputs.has_areas == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PLAN_RESULT: ${{ needs.plan.result }}
+      PLAN_BATCHES: ${{ needs.plan.outputs.batches }}
+      PLAN_META: ${{ needs.plan.outputs.meta }}
+      HRRR_CYCLE: ${{ needs.plan.outputs.hrrr_cycle }}
+      RUN_STATUS_STARTED: ${{ needs.plan.outputs.started }}
+      RESULTS_DIR: ${{ runner.temp }}/results
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download batch results
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/results
+
+      # Writes status/terrain-wind latest + history once; exits 1 if any tile failed
+      # so the failed-jobs rerun (auto-retry) picks up the failed batches and this job.
+      - name: Merge results and publish status
+        run: python3 scripts/terrain_wind.py finalize
