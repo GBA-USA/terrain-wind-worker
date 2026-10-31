@@ -26,6 +26,9 @@ DEM_URL = (
     "3DEPElevation/ImageServer/exportImage"
 )
 FORECAST_HOURS = range(1, 19)
+# Run-stamped objects never change; latest.json and coverage.json move every run (3 h cadence).
+CACHE_IMMUTABLE = "public, max-age=31536000, immutable"
+CACHE_LATEST = "public, max-age=300"
 HRRR_SUBSET_VARIABLES = frozenset(
     {"TMP", "UGRD", "VGRD", "TCDC", "LCDC", "RH", "DPT", "WIND", "PRATE", "DSWRF"}
 )
@@ -1359,7 +1362,7 @@ def publish_area(area, records, run_stamp, env, endpoint, bucket, output_prefix=
         local = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / f"{key}-{hour_stamp}.json.gz"
         local.write_bytes(body)
         object_key = f"{output_prefix}/{key}/{run_stamp}/{hour_stamp}.json.gz"
-        total += upload_file(local, object_key, env, endpoint, bucket, True)
+        total += upload_file(local, object_key, env, endpoint, bucket, True, cache_control=CACHE_IMMUTABLE)
         local.unlink(missing_ok=True)
         hour_index = {"hour": hour_stamp, "file": object_key}
         weather = payload.get("weather")
@@ -1370,16 +1373,34 @@ def publish_area(area, records, run_stamp, env, endpoint, bucket, output_prefix=
     index_key = f"{output_prefix}/{key}/{run_stamp}/index.json"
     index_path = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / f"{key}-index.json"
     index_path.write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
-    total += upload_file(index_path, index_key, env, endpoint, bucket, False)
+    total += upload_file(index_path, index_key, env, endpoint, bucket, False, cache_control=CACHE_IMMUTABLE)
     latest = {"v": 1, "area": key, "run": run_stamp, "index": index_key}
     latest_path = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / f"{key}-latest.json"
     latest_path.write_text(json.dumps(latest, indent=2) + "\n", encoding="utf-8")
-    total += upload_file(latest_path, f"{output_prefix}/{key}/latest.json", env, endpoint, bucket, False)
+    total += upload_file(
+        latest_path, f"{output_prefix}/{key}/latest.json", env, endpoint, bucket, False, cache_control=CACHE_LATEST
+    )
     index_path.unlink(missing_ok=True)
     latest_path.unlink(missing_ok=True)
     if output_prefix == "wind":
         delete_old_runs(key, run_stamp, env, endpoint, bucket, output_prefix)
-    return total
+    covered = {"area": key, "run": run_stamp, "hours": [{"hour": h["hour"], "file": h["file"]} for h in hours]}
+    return total, covered
+
+
+def coverage_key(output_prefix="wind"):
+    return f"{output_prefix}/coverage.json"
+
+
+def merge_coverage(existing, planned, published):
+    """This run's published tiles, plus the last entry for planned tiles that did not publish."""
+    wanted = set(planned)
+    tiles = {}
+    previous = existing.get("tiles") if isinstance(existing, dict) else None
+    for entry in list(previous or []) + list(published):
+        if isinstance(entry, dict) and entry.get("area") in wanted:
+            tiles[entry["area"]] = entry
+    return {"v": 1, "tiles": [tiles[key] for key in sorted(tiles)]}
 
 
 def hrrr_cache_dir_from_env():
@@ -1457,13 +1478,13 @@ def process_area(area, cycle, prefix, cache_dir, storage, run_options):
     for hour_stamp, payload in records:
         payload["run"] = run_stamp
         finished.append((hour_stamp, payload))
-    written = publish_area(area, finished, run_stamp, *storage, run_options["output_prefix"])
+    written, covered = publish_area(area, finished, run_stamp, *storage, run_options["output_prefix"])
     per_hour = hrrr_bytes / len(finished) if finished else 0
     log(
         f"area {key} hours={len(finished)} bytes={written} mode={mode} "
         f"hrrr_bytes={hrrr_bytes} hrrr_bytes_per_hour={per_hour:.0f}"
     )
-    return written
+    return written, covered
 
 
 def execute():
@@ -1521,9 +1542,12 @@ def execute():
             log(f"output_prefix={run_options['output_prefix']}")
         tiles_ok = []
         tiles_failed = []
+        published = []
         for area in areas:
             try:
-                uploaded += process_area(area, cycle, prefix, cache_dir, storage, run_options)
+                written, covered = process_area(area, cycle, prefix, cache_dir, storage, run_options)
+                uploaded += written
+                published.append(covered)
                 tiles_ok.append(area["key"])
             except Exception as exc:
                 failed += 1
@@ -1532,7 +1556,7 @@ def execute():
         status_fields["tiles_ok"] = tiles_ok
         status_fields["tiles_failed"] = tiles_failed
         elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-        write_result_file(tiles_ok, tiles_failed, uploaded, elapsed)
+        write_result_file(tiles_ok, tiles_failed, uploaded, elapsed, published)
         log(
             f"runtime_s={elapsed:.0f} uploaded_bytes={uploaded} "
             f"uploaded_mb={uploaded / 1_000_000:.3f} areas_failed={failed}"
@@ -1569,7 +1593,7 @@ def batch_cache_key(areas):
     return hashlib.sha256(stamp.encode()).hexdigest()[:16]
 
 
-def write_result_file(tiles_ok, tiles_failed, uploaded_bytes, runtime_s):
+def write_result_file(tiles_ok, tiles_failed, uploaded_bytes, runtime_s, published=()):
     raw = os.environ.get("RUN_RESULT_FILE", "").strip()
     if not raw:
         return
@@ -1582,6 +1606,7 @@ def write_result_file(tiles_ok, tiles_failed, uploaded_bytes, runtime_s):
                 "tiles_failed": tiles_failed,
                 "uploaded_bytes": uploaded_bytes,
                 "runtime_s": round(runtime_s, 1),
+                "published": list(published),
             },
             separators=(",", ":"),
         ),
@@ -1704,6 +1729,13 @@ def finalize():
         areas_coarse=int(meta.get("areas_coarse") or 0),
         hrrr_cycle=os.environ.get("HRRR_CYCLE", "").strip() or None,
     )
+    try:
+        key = coverage_key(normalize_output_prefix(os.environ.get("TERRAIN_WIND_PREFIX", "wind")))
+        published = [entry for result in (results if plan_ok else []) for entry in result.get("published") or []]
+        coverage = merge_coverage(status.store.read_json(key), planned, published)
+        status.store.write_json(key, coverage, cache_control=CACHE_LATEST)
+    except Exception as exc:
+        log(f"coverage write failed: {type(exc).__name__}")
     line = (
         f"conclusion={merged['conclusion']} tiles_ok={len(merged['tiles_ok'])} "
         f"tiles_failed={len(merged['tiles_failed'])} uploaded_bytes={merged['uploaded_bytes']} "
