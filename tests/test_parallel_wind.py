@@ -260,17 +260,75 @@ class StatusSkipAndFinalizeTests(unittest.TestCase):
                 "R2_BUCKET": "x",
                 "RUNNER_TEMP": tmp,
             }
+            covered = {"area": area["key"], "run": "2026-10-30T06:38:40Z", "hours": []}
             with mock.patch.dict(os.environ, env), mock.patch.object(
-                terrain_wind, "process_area", side_effect=[12345]
+                terrain_wind, "process_area", side_effect=[(12345, covered)]
             ), mock.patch.object(terrain_wind, "latest_hrrr_cycle", side_effect=AssertionError):
                 terrain_wind.execute()
             result = json.loads(result_file.read_text(encoding="utf-8"))
         self.assertEqual(
-            {k: result[k] for k in ("tiles_ok", "tiles_failed", "uploaded_bytes")},
-            {"tiles_ok": [area["key"]], "tiles_failed": [], "uploaded_bytes": 12345},
+            {k: result[k] for k in ("tiles_ok", "tiles_failed", "uploaded_bytes", "published")},
+            {"tiles_ok": [area["key"]], "tiles_failed": [], "uploaded_bytes": 12345, "published": [covered]},
         )
         self.assertIn("runtime_s", result)
         self.assertEqual(self.store.objects, {})
+
+    def test_finalize_writes_coverage_for_planned_tiles(self):
+        def entry(key, run):
+            return {"area": key, "run": run, "hours": [{"hour": "2026-10-30T07:00:00Z", "file": f"wind/{key}/{run}/h.json.gz"}]}
+
+        old, new = "2026-10-30T03:38:40Z", "2026-10-30T06:38:40Z"
+        self.store.write_json("wind/coverage.json", {"v": 1, "tiles": [entry("a", old), entry("b", old), entry("z", old)]})
+        with mock.patch.object(self.store, "write_json", wraps=self.store.write_json) as write:
+            code, _latest, _history = self.finalize(
+                ["a", "b", "c"],
+                [
+                    {"tiles_ok": ["a"], "tiles_failed": ["b"], "uploaded_bytes": 1, "runtime_s": 1, "published": [entry("a", new)]},
+                    {"tiles_ok": ["c"], "tiles_failed": [], "uploaded_bytes": 1, "runtime_s": 1, "published": [entry("c", new)]},
+                ],
+            )
+        self.assertEqual(code, 1)
+        coverage = self.store.read_json("wind/coverage.json")
+        self.assertEqual(coverage, {"v": 1, "tiles": [entry("a", new), entry("b", old), entry("c", new)]})
+        cache = {call.args[0]: call.kwargs.get("cache_control") for call in write.call_args_list}
+        self.assertEqual(cache["wind/coverage.json"], terrain_wind.CACHE_LATEST)
+
+    def test_failed_plan_keeps_previous_coverage(self):
+        previous = {"v": 1, "tiles": [{"area": "a", "run": "2026-10-30T03:38:40Z", "hours": []}]}
+        self.store.write_json("wind/coverage.json", previous)
+        self.finalize(
+            ["a"],
+            [{"tiles_ok": ["a"], "tiles_failed": [], "uploaded_bytes": 1, "runtime_s": 1, "published": [{"area": "a", "run": "x", "hours": []}]}],
+            plan_result="failure",
+        )
+        self.assertEqual(self.store.read_json("wind/coverage.json"), previous)
+
+
+class PublishCacheControlTests(unittest.TestCase):
+    def test_publish_area_sets_cache_control_and_returns_coverage_entry(self):
+        commands = []
+        area = fake_areas(1)[0]
+        run, hour = "2026-10-30T06:38:40Z", "2026-10-30T07:00:00Z"
+        records = [(hour, {"hour": hour, "u": [1], "v": [0], "weather": {"temperature_c": 1}})]
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"RUNNER_TEMP": tmp}), mock.patch.object(
+            terrain_wind, "aws", side_effect=lambda args, env: commands.append(args)
+        ), mock.patch.object(terrain_wind, "delete_old_runs"):
+            total, covered = terrain_wind.publish_area(area, records, run, {}, "https://r2", "bucket")
+        self.assertGreater(total, 0)
+        by_key = {args[3].split("bucket/", 1)[1]: args for args in commands}
+
+        def cache(key):
+            args = by_key[key]
+            return args[args.index("--cache-control") + 1]
+
+        run_dir = f"wind/{area['key']}/{run}"
+        self.assertEqual(cache(f"{run_dir}/{hour}.json.gz"), terrain_wind.CACHE_IMMUTABLE)
+        self.assertEqual(cache(f"{run_dir}/index.json"), terrain_wind.CACHE_IMMUTABLE)
+        self.assertEqual(cache(f"wind/{area['key']}/latest.json"), terrain_wind.CACHE_LATEST)
+        self.assertEqual(
+            covered,
+            {"area": area["key"], "run": run, "hours": [{"hour": hour, "file": f"{run_dir}/{hour}.json.gz"}]},
+        )
 
 
 class CachedHrrrFetchTests(unittest.TestCase):
