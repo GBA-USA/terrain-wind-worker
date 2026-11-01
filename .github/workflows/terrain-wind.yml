@@ -125,6 +125,7 @@ jobs:
       BATCH_INDEX: ${{ matrix.batch }}
       TERRAIN_WIND_HRRR_CYCLE: ${{ needs.plan.outputs.hrrr_cycle }}
       RUN_STATUS_SKIP: "true"
+      TERRAIN_WIND_VEGETATION_FROM_COVER: ${{ vars.TERRAIN_WIND_VEGETATION_FROM_COVER || 'false' }}
     steps:
       - uses: actions/checkout@v4
 
