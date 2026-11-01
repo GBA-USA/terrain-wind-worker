@@ -13,10 +13,12 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -25,6 +27,21 @@ DEM_URL = (
     "https://elevation.nationalmap.gov/arcgis/rest/services/"
     "3DEPElevation/ImageServer/exportImage"
 )
+NLCD_COVERAGE_URL = (
+    "https://www.mrlc.gov/geoserver/mrlc_download/wcs?service=WCS&version=2.0.1&request=GetCoverage"
+    "&coverageId=mrlc_download__NLCD_2021_Land_Cover_L48&format=image/tiff"
+    "&subsettingCrs=http://www.opengis.net/def/crs/EPSG/0/4326"
+)
+NLCD_LAND_CLASSES = frozenset({12, 21, 22, 23, 24, 31, 41, 42, 43, 51, 52, 71, 72, 73, 74, 81, 82, 90, 95})
+NLCD_FOREST_CLASSES = frozenset({41, 42, 43, 90})
+NLCD_SHRUB_CLASSES = frozenset({51, 52})
+CONUS_BBOX = (-125.0, 24.0, -66.0, 50.0)
+# JUDGMENT CALL: forest on at least half the land makes the whole tile trees.
+VEG_TREES_SHARE = 0.5
+# JUDGMENT CALL: forest plus shrub on at least half the land makes the tile brush.
+VEG_BRUSH_SHARE = 0.5
+# JUDGMENT CALL: under this many land pixels the shares mean little, so the tile stays grass.
+VEG_MIN_PIXELS = 50
 FORECAST_HOURS = range(1, 19)
 # Run-stamped objects never change; latest.json and coverage.json move every run (3 h cadence).
 CACHE_IMMUTABLE = "public, max-age=31536000, immutable"
@@ -507,6 +524,57 @@ def dem_for(area, cache_dir):
     return dest
 
 
+def vegetation_for_counts(counts):
+    land = sum(pixels for code, pixels in counts.items() if code in NLCD_LAND_CLASSES)
+    if land < VEG_MIN_PIXELS:
+        return "grass"
+    forest = sum(counts.get(code, 0) for code in NLCD_FOREST_CLASSES)
+    shrub = sum(counts.get(code, 0) for code in NLCD_SHRUB_CLASSES)
+    if forest / land >= VEG_TREES_SHARE:
+        return "trees"
+    if (forest + shrub) / land >= VEG_BRUSH_SHARE:
+        return "brush"
+    return "grass"
+
+
+def fetch_cover_counts(bbox):
+    min_lon, min_lat, max_lon, max_lat = bbox
+    url = f"{NLCD_COVERAGE_URL}&subset=Long({min_lon},{max_lon})&subset=Lat({min_lat},{max_lat})"
+    is_tiff = lambda body: body[:4] in TIFF_MAGIC
+    data, _headers = http_bytes_retry("NLCD download", url, timeout=60, attempts=2, backoffs=(5,), validate=is_tiff)
+    with tempfile.TemporaryDirectory() as tmp:
+        tif, asc = Path(tmp) / "cover.tif", Path(tmp) / "cover.asc"
+        tif.write_bytes(data)
+        window = [str(min_lon), str(max_lat), str(max_lon), str(min_lat)]
+        run(["gdal_translate", "-q", "-of", "AAIGrid", "-projwin", *window, str(tif), str(asc)])
+        _ncols, _nrows, nodata, values = read_asc(asc)
+    return Counter(int(value) for value in values if value != nodata)
+
+
+def cover_vegetation_for(area, cache_dir):
+    key = area["key"]
+    bbox = area["bbox"]
+    lon = (bbox[0] + bbox[2]) / 2.0
+    lat = (bbox[1] + bbox[3]) / 2.0
+    if not (CONUS_BBOX[0] <= lon <= CONUS_BBOX[2] and CONUS_BBOX[1] <= lat <= CONUS_BBOX[3]):
+        log(f"area {key} outside NLCD coverage, vegetation grass")
+        return "grass"
+    dest = cache_dir / f"{key}.veg"
+    stamp_path = cache_dir / f"{key}.veg.stamp"
+    stamp = hashlib.sha256(json.dumps(bbox).encode()).hexdigest()
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        if dest.is_file() and stamp_path.is_file() and stamp_path.read_text(encoding="utf-8").strip() == stamp:
+            return dest.read_text(encoding="utf-8").strip()
+        vegetation = vegetation_for_counts(fetch_cover_counts(bbox))
+        dest.write_text(vegetation + "\n", encoding="utf-8")
+        stamp_path.write_text(stamp + "\n", encoding="utf-8")
+        return vegetation
+    except Exception as exc:
+        log(f"area {key} land cover failed, vegetation grass: {scrub(exc, bbox)}")
+        return "grass"
+
+
 def latest_hrrr_cycle():
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     for back in range(1, 12):
@@ -987,6 +1055,7 @@ def windninja_run_options_from_env():
         "diurnal": env_bool("TERRAIN_WIND_DIURNAL", True),
         "stability": env_bool("TERRAIN_WIND_STABILITY", True),
         "momentum": env_bool("TERRAIN_WIND_MOMENTUM", False),
+        "vegetation_from_cover": env_bool("TERRAIN_WIND_VEGETATION_FROM_COVER", False),
         "utc_hours": parse_utc_hours(),
         "output_prefix": normalize_output_prefix(os.environ.get("TERRAIN_WIND_PREFIX", "wind")),
     }
@@ -1009,7 +1078,7 @@ def cfg_bool(value):
     return "true" if value else "false"
 
 
-def build_base_cfg_pairs(dem, out_dir, options, cell_m=CELL_M):
+def build_base_cfg_pairs(dem, out_dir, options, cell_m=CELL_M, vegetation="grass"):
     if cell_m not in ALLOWED_CELL_M:
         cell_m = CELL_M
     diurnal = options["diurnal"]
@@ -1022,7 +1091,7 @@ def build_base_cfg_pairs(dem, out_dir, options, cell_m=CELL_M):
         ("output_wind_height", "10"),
         ("units_output_wind_height", "m"),
         ("output_speed_units", "mps"),
-        ("vegetation", "grass"),
+        ("vegetation", vegetation),
         ("mesh_resolution", str(cell_m)),
         ("units_mesh_resolution", "m"),
         ("diurnal_winds", cfg_bool(diurnal)),
@@ -1053,10 +1122,10 @@ def build_base_cfg_pairs(dem, out_dir, options, cell_m=CELL_M):
     return pairs
 
 
-def base_cfg(dem, out_dir, options=None, cell_m=CELL_M):
+def base_cfg(dem, out_dir, options=None, cell_m=CELL_M, vegetation="grass"):
     if options is None:
         options = windninja_run_options_from_env()
-    return build_base_cfg_pairs(dem, out_dir, options, cell_m=cell_m)
+    return build_base_cfg_pairs(dem, out_dir, options, cell_m=cell_m, vegetation=vegetation)
 
 
 def ensure_momentum_supported(env):
@@ -1186,12 +1255,12 @@ def find_uv(out_dir):
     return u_files[0], v_files[0]
 
 
-def solve_hour(mode, grib, dem, bbox, valid, work, env, run_options, cell_m=CELL_M):
+def solve_hour(mode, grib, dem, bbox, valid, work, env, run_options, cell_m=CELL_M, vegetation="grass"):
     out_dir = work / "out"
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True)
-    pairs = base_cfg(dem, out_dir, run_options, cell_m=cell_m)
+    pairs = base_cfg(dem, out_dir, run_options, cell_m=cell_m, vegetation=vegetation)
     if mode == "wx":
         pairs[2:2] = [
             ("initialization_method", "wxModelInitialization"),
@@ -1417,6 +1486,7 @@ def process_area(area, cycle, prefix, cache_dir, storage, run_options):
         shutil.rmtree(work_root)
     work_root.mkdir(parents=True)
     dem = dem_for(area, cache_dir)
+    vegetation = cover_vegetation_for(area, cache_dir) if run_options["vegetation_from_cover"] else "grass"
     env = windninja_env(prefix)
     nx, ny, resolved_cell_m = grid_shape(bbox, cell_m=cell_m)
     mode = "wx"
@@ -1437,14 +1507,14 @@ def process_area(area, cycle, prefix, cache_dir, storage, run_options):
             weather = weather_from_grib(grib, bbox, hour_work)
             try:
                 u_asc, v_asc = solve_hour(
-                    mode, grib, dem, bbox, valid, hour_work, env, run_options, cell_m=cell_m
+                    mode, grib, dem, bbox, valid, hour_work, env, run_options, cell_m=cell_m, vegetation=vegetation
                 )
             except Exception:
                 if mode == "wx":
                     log(f"area {key} HRRR subset not accepted; using gridded initialization")
                     mode = "gridded"
                     u_asc, v_asc = solve_hour(
-                        mode, grib, dem, bbox, valid, hour_work, env, run_options, cell_m=cell_m
+                        mode, grib, dem, bbox, valid, hour_work, env, run_options, cell_m=cell_m, vegetation=vegetation
                     )
                 else:
                     raise

@@ -68,6 +68,8 @@ Hour JSON:
 
 Each hour uses NOAA HRRR 10 m wind plus those scalar fields (AWS Open Data GRIB `.idx` byte ranges), a USGS 3DEP DEM cached by area key, and WindNinja with diurnal winds and non-neutral stability.
 
+`TERRAIN_WIND_VEGETATION_FROM_COVER` (repo variable, default `false`): when true, wind uses local land cover for ground roughness, picking `grass`, `brush` or `trees` per tile from NLCD 2021 and falling back to `grass` if the land cover is unavailable.
+
 ## Offline packs
 
 Separate workflow `offline-packs` builds public map chunks (Mapterhorn DEM + PAD-US) into the same R2 bucket. Triggers: daily `30 7 * * *` UTC, `workflow_dispatch` with `test=true` (fixture areas), and `repository_dispatch` type `areas-changed`. Concurrency group `offline-packs`.
